@@ -219,6 +219,27 @@ def test_datakey_unreachable_defers_not_drops(fake_ingest: FakeIngest) -> None:
     assert AESGCM(bytes(key)).decrypt(nonce, ciphertext, None) == b'{"prompt":"secret"}'
 
 
+def test_size_trigger_drains_before_interval(fake_ingest: FakeIngest) -> None:
+    import time
+
+    # Interval set to 30s so the timer can't fire within the test window — any
+    # drain proves the flush_threshold size trigger woke the flusher.
+    inst = runfile_ai.init(
+        api_key=VALID_TEST_KEY, base_url=fake_ingest.base_url, start_flusher=False
+    )
+    inst._flusher.interval_seconds = 30
+    inst.buffer.flush_threshold = 3
+    inst._flusher.start()
+
+    with runfile_ai.run(agent_identity=AGENT):
+        for i in range(3):  # run_create + 3 events >= threshold → size trigger
+            runfile_ai.capture_event(kind="tool_call", name=f"t{i}")
+        deadline = time.monotonic() + 3.0
+        while fake_ingest.batch_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert fake_ingest.batch_count >= 1  # drained by size trigger, not the 30s timer
+
+
 def test_background_thread_drains(fake_ingest: FakeIngest) -> None:
     import time
 

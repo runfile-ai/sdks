@@ -50,6 +50,6 @@ regenerate, and redeploy the Ingest / Event-Processor validators first.)
    wire the Vault `/v1/tokenize` client (needs the Vault request/response contract).
 2. **Framework adapters** — LangGraph first (v1 priority), then OpenAI Agents,
    Claude Agent SDK, MCP. The customer-facing surface.
-3. Decorators (`capture_decision`), size-based flush trigger, telemetry/logging.
+3. Decorators (`capture_decision`), telemetry/logging.
 
 Then: TypeScript core (mirror), Verifier CLI logic, end-to-end examples.

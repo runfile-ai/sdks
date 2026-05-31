@@ -156,11 +156,16 @@ def _buffer_append(run: Run, item: Any) -> None:
     if inst.disabled or run.dropped:
         return  # disabled SDK: silent no-op; dropped run: already abandoned
     inst.buffer.append(item)
-    if len(inst.buffer) >= inst.buffer.soft_cap:
+    buffered = len(inst.buffer)
+    if buffered >= inst.buffer.soft_cap:
         if inst.capture_blocking:
             inst.flush()
         else:
             _drop_run_overflow(inst, run)
+    elif buffered >= inst.buffer.flush_threshold:
+        # Size trigger: nudge the background flusher (non-blocking) so a burst
+        # drains promptly instead of waiting out the 2s interval.
+        inst.notify_flusher()
 
 
 def _drop_run_overflow(inst: Any, run: Run) -> None:

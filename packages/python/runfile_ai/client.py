@@ -158,6 +158,10 @@ class RunfileClient:
             except Exception:
                 pass  # a customer callback must never break capture
 
+    def notify_flusher(self) -> None:
+        """Nudge the background flusher to drain promptly (buffer size trigger)."""
+        self._flusher.notify()
+
     def flush(self) -> None:
         """Force a synchronous buffer drain. Blocks until the in-flight batches ship."""
         self._flusher.flush_now()

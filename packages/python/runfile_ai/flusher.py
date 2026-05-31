@@ -102,6 +102,9 @@ class Flusher:
     _last_event_hash: dict[str, str] = field(default_factory=dict)
     _drain_lock: threading.Lock = field(default_factory=threading.Lock)
     _stop: threading.Event = field(default_factory=threading.Event)
+    # Set by capture when the buffer crosses flush_threshold (size trigger) and by
+    # stop(); wakes the loop before the interval elapses.
+    _wake: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
     # Sticky: a 401/403 means the key is bad — stop hammering the API; keep
     # capturing + spooling encrypted batches for after the key is fixed.
@@ -117,8 +120,18 @@ class Flusher:
         )
         self._thread.start()
 
+    def notify(self) -> None:
+        """Wake the background flusher to drain now (size-based trigger).
+
+        Non-blocking: capture calls this when the buffer hits flush_threshold so a
+        burst drains promptly instead of waiting out the interval. No-op if the
+        background thread isn't running (e.g. tests flush manually).
+        """
+        self._wake.set()
+
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()  # interrupt the interval wait so the loop exits promptly
         if self._thread is not None:
             self._thread.join(timeout=self.interval_seconds + 5)
             self._thread = None
@@ -133,7 +146,12 @@ class Flusher:
             self.retry = saved
 
     def _loop(self) -> None:
-        while not self._stop.wait(self.interval_seconds):
+        # Drain on the interval (2s) OR when woken by the size trigger (100 items).
+        while not self._stop.is_set():
+            self._wake.wait(timeout=self.interval_seconds)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
             try:
                 self.client.refresh_policy_if_stale()
                 self.flush_now()
