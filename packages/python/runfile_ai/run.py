@@ -55,6 +55,11 @@ class Run:
     local_seq: int = 0
     last_event_hash_local: Optional[str] = None  # set by the flusher as it chains
     dropped: bool = False  # set when the run is abandoned due to buffer overflow
+    # Parent-event continuity for adapters whose callbacks fire OUTSIDE the ambient
+    # context (e.g. framework hooks dispatched on another task): the adapter binds
+    # this as the parent before each capture and writes the new event id back, so
+    # chaining survives without relying on contextvars persisting between calls.
+    last_parent_event_id: Optional[str] = None
     _run_token: Any = field(default=None, repr=False, compare=False)
     _parent_token: Any = field(default=None, repr=False, compare=False)
 
@@ -114,6 +119,11 @@ def _build_event(
     parallel_group_id = current_parallel_group()
     if parallel_group_id is not None:
         event["parallel_group_id"] = parallel_group_id
+    # action_extra merges into the action sub-object (outcome, duration_ms) rather
+    # than becoming a stray top-level field.
+    action_extra = extra.pop("action_extra", None)
+    if action_extra:
+        event["action"].update(action_extra)
     for key, value in extra.items():
         if value is not None:
             event[key] = value
@@ -190,24 +200,31 @@ def _drop_run_overflow(inst: Any, run: Run) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def start_run(
+def create_run(
     *,
     agent_identity: str,
     conversation_id: Optional[str] = None,
     framework: str = "manual",
+    run_id: Optional[str] = None,
     continued_from: Optional[dict[str, str]] = None,
+    delegated_from: Optional[dict[str, str]] = None,
+    handed_off_from: Optional[dict[str, str]] = None,
+    labels: Optional[dict[str, str]] = None,
 ) -> Run:
-    """Begin a run: emit a ``run_create`` item and set ambient context."""
+    """Create a run and emit its ``run_create`` item, WITHOUT touching ambient context.
+
+    This is the explicit-run primitive that framework adapters use: they key runs
+    by a framework cursor (session_id, thread_id, agent_id) and bind context per
+    callback, rather than relying on a single ambient run. :func:`start_run` layers
+    ambient-context management on top of this for the manual API.
+    """
     inst = _require_instance()
     run = Run(
-        run_id=generate_run_id(),
+        run_id=run_id or generate_run_id(),
         agent_identity=agent_identity,
         framework=framework,
         conversation_id=conversation_id,
     )
-    run._run_token = set_current_run(run)
-    run._parent_token = set_parent_event(None)
-
     run_body: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION_FULL,
         "run_id": run.run_id,
@@ -222,15 +239,47 @@ def start_run(
         run_body["conversation_id"] = conversation_id
     if continued_from is not None:
         run_body["continued_from"] = continued_from
+    if delegated_from is not None:
+        run_body["delegated_from"] = delegated_from
+    if handed_off_from is not None:
+        run_body["handed_off_from"] = handed_off_from
+    if labels:
+        run_body["labels"] = labels
 
     _buffer_append(run, BufferedRunItem(item={"type": "run_create", "run": run_body}, run=run))
     return run
 
 
-def end_run(*, outcome: str = "success", final_event_id: Optional[str] = None) -> None:
-    """End the current run: emit a ``run_end`` item and clear ambient context."""
-    run = current_run()
-    if run is None:
+def start_run(
+    *,
+    agent_identity: str,
+    conversation_id: Optional[str] = None,
+    framework: str = "manual",
+    continued_from: Optional[dict[str, str]] = None,
+    labels: Optional[dict[str, str]] = None,
+) -> Run:
+    """Begin a run (manual API): emit a ``run_create`` item and set ambient context."""
+    run = create_run(
+        agent_identity=agent_identity,
+        conversation_id=conversation_id,
+        framework=framework,
+        continued_from=continued_from,
+        labels=labels,
+    )
+    run._run_token = set_current_run(run)
+    run._parent_token = set_parent_event(None)
+    return run
+
+
+def emit_run_end(
+    run: Run, *, outcome: str = "success", final_event_id: Optional[str] = None
+) -> None:
+    """Emit a ``run_end`` item for an explicit run, WITHOUT clearing ambient context.
+
+    The explicit-run counterpart to :func:`end_run` (which targets the ambient run
+    and tears down its context). Idempotent: a no-op once the run has ended.
+    """
+    if run.lifecycle_state == "ended":
         return
     item: dict[str, Any] = {
         "type": "run_end",
@@ -242,6 +291,14 @@ def end_run(*, outcome: str = "success", final_event_id: Optional[str] = None) -
         item["final_event_id"] = final_event_id
     _buffer_append(run, BufferedRunItem(item=item, run=run))
     run.lifecycle_state = "ended"
+
+
+def end_run(*, outcome: str = "success", final_event_id: Optional[str] = None) -> None:
+    """End the current ambient run: emit a ``run_end`` item and clear ambient context."""
+    run = current_run()
+    if run is None:
+        return
+    emit_run_end(run, outcome=outcome, final_event_id=final_event_id)
     _clear_run_context(run)
 
 
@@ -251,17 +308,25 @@ def suspend_run(
     name: Optional[str] = None,
     expected_resumer: Optional[str] = None,
     expected_resume_by: Optional[str] = None,
+    detection_source: str = "customer_explicit",
+    framework_signal: Optional[dict[str, Any]] = None,
 ) -> str:
     """Emit a ``run_suspend`` event + a ``run_update`` flipping to ``awaiting_*``.
 
     Returns the run_suspend event_id (the ``triggered_by_event_id`` link).
+
+    The manual API defaults ``detection_source="customer_explicit"``; framework
+    adapters pass ``"framework_inferred"`` plus the ``framework_signal`` they
+    observed (so auditors can verify the suspension was grounded in a real signal).
     """
     run = _require_run()
-    details: dict[str, Any] = {"reason": reason, "detection_source": "customer_explicit"}
+    details: dict[str, Any] = {"reason": reason, "detection_source": detection_source}
     if expected_resumer is not None:
         details["expected_resumer"] = expected_resumer
     if expected_resume_by is not None:
         details["expected_resume_by"] = expected_resume_by
+    if framework_signal is not None:
+        details["framework_signal"] = framework_signal
 
     event_id = _emit_event(run, kind="run_suspend", name=name or reason, suspension_details=details)
     state = _AWAITING_STATE.get(reason, "awaiting_human")

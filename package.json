@@ -15,7 +15,7 @@
     "lint": "pnpm -r run lint",
     "clean": "pnpm -r run clean",
     "changeset": "changeset",
-    "changeset:version": "changeset version",
+    "changeset:version": "changeset version && node scripts/sync-python-version.mjs",
     "changeset:publish": "pnpm run build && changeset publish"
   },
   "devDependencies": {
