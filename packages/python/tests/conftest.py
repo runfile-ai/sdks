@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,6 +13,12 @@ from runfile_ai import context as _ctx
 from tests.fake_ingest import FakeIngest
 
 VALID_TEST_KEY = "rf_test_" + "a" * 32
+
+
+@pytest.fixture(autouse=True)
+def _spool_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point every test's spool at a temp dir so nothing pollutes ~/.runfile."""
+    monkeypatch.setenv("RUNFILE_SPOOL_DIR", str(tmp_path / "spool"))
 
 
 @pytest.fixture(autouse=True)

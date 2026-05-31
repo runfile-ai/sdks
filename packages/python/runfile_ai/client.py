@@ -8,7 +8,10 @@ path — does classification, redaction, encryption, batching, and shipping.
 
 from __future__ import annotations
 
+import atexit
+import os
 import re
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -17,6 +20,7 @@ from ._constants import DEFAULT_BASE_URL, DEFAULT_REGION
 from .buffer import EventBuffer
 from .datakey import DataKeyCache
 from .policy import PolicyCache
+from .spool import DEFAULT_SPOOL_DIR, Spool
 
 _API_KEY_RE = re.compile(r"^rf_(live|test)_[a-z0-9]{32}$")
 
@@ -36,6 +40,7 @@ class RunfileClient:
         disabled: bool = False,
         start_flusher: bool = True,
         fetch_policy: bool = True,
+        spool_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         if not disabled and not _API_KEY_RE.match(api_key):
             raise ValueError("invalid API key shape; expected rf_<live|test>_<32 base32 chars>")
@@ -58,6 +63,9 @@ class RunfileClient:
         if fetch_policy and not disabled:
             self._policy_cache.refresh_if_stale()  # best-effort; never blocks capture
 
+        resolved_spool = spool_dir or os.environ.get("RUNFILE_SPOOL_DIR") or DEFAULT_SPOOL_DIR
+        self.spool = Spool(directory=Path(resolved_spool))
+
         # Background flusher (chain → encrypt → ship). Importing here avoids a
         # module-level import cycle (flusher type-checks against this class).
         from .flusher import Flusher
@@ -65,7 +73,17 @@ class RunfileClient:
         self._flusher = Flusher(client=self)
         if start_flusher and not disabled:
             self._flusher.start()
-        # TODO (next slice): Spool (ciphertext-only disk durability) + atexit drain.
+
+        # Best-effort final drain on clean interpreter exit (atexit doesn't run on
+        # SIGKILL/OOM — the on-disk spool is the real durability mechanism).
+        if not disabled:
+            atexit.register(self._atexit_drain)
+
+    def _atexit_drain(self) -> None:
+        try:
+            self._flusher.flush_now()
+        except Exception:
+            pass
 
     @property
     def redaction_policy_version(self) -> str:
@@ -82,6 +100,7 @@ class RunfileClient:
 
     def shutdown(self) -> None:
         """Graceful shutdown: stop + final-drain the flusher, then release resources."""
+        atexit.unregister(self._atexit_drain)
         self._flusher.stop()
         self.datakeys.zeroize()
         self._http.close()
@@ -96,6 +115,7 @@ def init(
     disabled: bool = False,
     start_flusher: bool = True,
     fetch_policy: bool = True,
+    spool_dir: str | os.PathLike[str] | None = None,
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance)."""
     global _instance
@@ -109,6 +129,7 @@ def init(
         disabled=disabled,
         start_flusher=start_flusher,
         fetch_policy=fetch_policy,
+        spool_dir=spool_dir,
     )
     return _instance
 

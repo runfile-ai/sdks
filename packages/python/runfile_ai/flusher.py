@@ -70,7 +70,8 @@ class DrainResult:
     items_accepted: int = 0
     items_rejected: int = 0
     items_invalid: int = 0  # failed LOCAL validation but shipped raw (chain-preserving)
-    items_dropped: int = 0  # exhausted retries / terminal 4xx (data lost — spool TODO)
+    items_spooled: int = 0  # retries exhausted → persisted to disk for a later drain
+    items_dropped: int = 0  # terminal 4xx, or spool full (data lost)
 
 
 @dataclass
@@ -124,14 +125,29 @@ class Flusher:
     def flush_now(self) -> DrainResult:
         """Synchronously drain and ship everything currently buffered."""
         with self._drain_lock:
-            items = self.client.buffer.take_all()
             result = DrainResult()
+            # Re-send anything spooled by a prior failed drain first (FIFO).
+            self._drain_spool(result)
+            items = self.client.buffer.take_all()
             if not items:
                 return result
             wire_items = [self._to_wire_item(item, result) for item in items]
             for chunk in _chunks(wire_items, _MAX_ITEMS_PER_BATCH):
                 self._ship_batch(chunk, result)
             return result
+
+    def _drain_spool(self, result: DrainResult) -> None:
+        """Re-send spooled batches (ciphertext only) with their original keys."""
+        for entry in self.client.spool.entries():
+            try:
+                self._post_with_retry(entry.body, entry.idempotency_key)
+            except _ShipError:
+                break  # still failing — leave this and the rest for the next drain
+            else:
+                # Any returned status (200/207, or terminal 4xx) means "done with
+                # this entry": delivered, or permanently rejected. Drop it.
+                self.client.spool.delete(entry.path)
+                result.batches_sent += 1
 
     def _to_wire_item(self, item: BufferedItem, result: DrainResult) -> dict[str, Any]:
         """Turn a buffered item into a wire batch item, chaining events.
@@ -224,7 +240,12 @@ class Flusher:
         try:
             status, payload = self._post_with_retry(body, idempotency_key)
         except _ShipError:
-            result.items_dropped += len(items)  # TODO: spool instead of drop
+            # Transient failure, retries exhausted → persist (ciphertext only) for
+            # a later drain rather than lose it. If the spool is full, drop + flag.
+            if self.client.spool.write(idempotency_key, body):
+                result.items_spooled += len(items)
+            else:
+                result.items_dropped += len(items)
             return
         if status == 200:
             result.batches_sent += 1
