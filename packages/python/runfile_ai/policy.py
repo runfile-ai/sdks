@@ -68,11 +68,3 @@ class PolicyCache:
             self._policy = policy
             self._expires_monotonic = time.monotonic() + policy.ttl_seconds
         return policy
-
-    def refresh_if_stale(self) -> None:
-        """Best-effort refresh; swallow errors (keep the last known policy)."""
-        try:
-            if self.is_stale():
-                self.fetch()
-        except Exception:
-            pass

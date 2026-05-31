@@ -12,10 +12,11 @@ import atexit
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
+from ._clock import utc_now_iso
 from ._constants import DEFAULT_REGION, default_base_url
 from .buffer import EventBuffer
 from .classifier import Redactor
@@ -25,6 +26,12 @@ from .spool import DEFAULT_SPOOL_DIR, Spool
 from .vault import VaultClient
 
 _API_KEY_RE = re.compile(r"^rf_(live|test)_[a-z0-9]{32}$")
+
+# Keep a bounded tail of recent diagnostics for introspection.
+_MAX_DIAGNOSTICS = 256
+
+#: A diagnostic record: {code, severity, detail, at}.
+Diagnostic = dict[str, Any]
 
 _instance: Optional["RunfileClient"] = None
 
@@ -45,12 +52,17 @@ class RunfileClient:
         spool_dir: str | os.PathLike[str] | None = None,
         buffer_soft_cap: int = 10_000,
         capture_blocking: bool = True,
+        on_diagnostic: Callable[[Diagnostic], None] | None = None,
     ) -> None:
         if not disabled and not _API_KEY_RE.match(api_key):
             raise ValueError("invalid API key shape; expected rf_<live|test>_<32 base32 chars>")
         self.api_key = api_key
         self.environment = environment
         self.region = region
+        # Diagnostics surface. Default is silent (no stdout/stderr) per spec; the
+        # customer opts in via on_diagnostic to wire it to their logger/SIEM.
+        self._on_diagnostic = on_diagnostic
+        self.diagnostics: list[Diagnostic] = []
         # One regional host fronts every endpoint; derived from region unless the
         # caller overrides base_url (OpenAI/Anthropic-style).
         self.base_url = (base_url or default_base_url(region)).rstrip("/")
@@ -70,7 +82,7 @@ class RunfileClient:
             client=self._http, base_url=self.base_url, api_key=self.api_key
         )
         if fetch_policy and not disabled:
-            self._policy_cache.refresh_if_stale()  # best-effort; never blocks capture
+            self.refresh_policy_if_stale()  # best-effort; emits a diagnostic on failure
 
         resolved_spool = spool_dir or os.environ.get("RUNFILE_SPOOL_DIR") or DEFAULT_SPOOL_DIR
         self.spool = Spool(directory=Path(resolved_spool))
@@ -111,8 +123,40 @@ class RunfileClient:
         return self._policy_cache.current()
 
     def refresh_policy_if_stale(self) -> None:
-        """Best-effort policy refresh, called periodically by the flusher thread."""
-        self._policy_cache.refresh_if_stale()
+        """Best-effort policy refresh; emits a diagnostic on failure (never raises).
+
+        Called on init and periodically by the flusher thread. Capture never
+        blocks on policy — on failure the last-known policy keeps being used.
+        """
+        if not self._policy_cache.is_stale():
+            return
+        try:
+            self._policy_cache.fetch()
+        except Exception as exc:
+            self.emit_diagnostic("policy_refresh_failed", detail=str(exc))
+
+    def emit_diagnostic(
+        self, code: str, *, detail: str | None = None, severity: str = "warning"
+    ) -> None:
+        """Record an SDK health diagnostic and surface it via on_diagnostic.
+
+        Used for failures that aren't run-scoped wire events (policy refresh, auth)
+        — kept observable without ever writing to stdout/stderr by default.
+        """
+        record: Diagnostic = {
+            "code": code,
+            "severity": severity,
+            "detail": detail,
+            "at": utc_now_iso(),
+        }
+        self.diagnostics.append(record)
+        if len(self.diagnostics) > _MAX_DIAGNOSTICS:
+            del self.diagnostics[0]
+        if self._on_diagnostic is not None:
+            try:
+                self._on_diagnostic(record)
+            except Exception:
+                pass  # a customer callback must never break capture
 
     def flush(self) -> None:
         """Force a synchronous buffer drain. Blocks until the in-flight batches ship."""
@@ -138,11 +182,13 @@ def init(
     spool_dir: str | os.PathLike[str] | None = None,
     buffer_soft_cap: int = 10_000,
     capture_blocking: bool = True,
+    on_diagnostic: Callable[[Diagnostic], None] | None = None,
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance).
 
     ``base_url`` defaults to ``https://api.<region>.runfile.ai``; pass it only to
-    target a non-standard host.
+    target a non-standard host. ``on_diagnostic`` receives SDK health records
+    (policy-refresh failure, auth failure, overflow drops); default is silent.
     """
     global _instance
     if _instance is not None:
@@ -158,6 +204,7 @@ def init(
         spool_dir=spool_dir,
         buffer_soft_cap=buffer_soft_cap,
         capture_blocking=capture_blocking,
+        on_diagnostic=on_diagnostic,
     )
     return _instance
 

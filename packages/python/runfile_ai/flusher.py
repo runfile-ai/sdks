@@ -103,6 +103,9 @@ class Flusher:
     _drain_lock: threading.Lock = field(default_factory=threading.Lock)
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
+    # Sticky: a 401/403 means the key is bad — stop hammering the API; keep
+    # capturing + spooling encrypted batches for after the key is fixed.
+    _auth_failed: bool = False
 
     # ---- thread lifecycle ------------------------------------------------- #
 
@@ -144,7 +147,9 @@ class Flusher:
         with self._drain_lock:
             result = DrainResult()
             # Re-send anything spooled by a prior failed drain first (FIFO).
-            self._drain_spool(result)
+            # Skip while auth is broken — re-posting would just 401 again.
+            if not self._auth_failed:
+                self._drain_spool(result)
             items = self.client.buffer.take_all()
             if not items:
                 return result
@@ -152,11 +157,13 @@ class Flusher:
             for idx, item in enumerate(items):
                 try:
                     wire_items.append(self._to_wire_item(item, result))
-                except DataKeyError:
+                except DataKeyError as exc:
                     # Can't encrypt without a data key. NEVER spool plaintext and
                     # NEVER drop — hold the unprocessed items in memory and retry
                     # on the next drain (data-key failure-mode #2). Defer this item
                     # and everything after it so per-run order / chaining is kept.
+                    if exc.status in (401, 403):
+                        self._on_auth_failure(f"/v1/data-keys {exc.status}")
                     deferred = items[idx:]
                     self.client.buffer.requeue_front(deferred)
                     result.items_deferred += len(deferred)
@@ -300,27 +307,48 @@ class Flusher:
             return
         body = {"batch_id": generate_batch_id(), "items": items}
         idempotency_key = _uuid4()
+
+        # Auth is known-broken: don't POST (it would 401). Persist the encrypted
+        # batch for after the key is fixed.
+        if self._auth_failed:
+            self._spool_or_drop(idempotency_key, body, len(items), result)
+            return
+
         try:
             status, payload = self._post_with_retry(body, idempotency_key)
         except _ShipError:
             # Transient failure, retries exhausted → persist (ciphertext only) for
             # a later drain rather than lose it. If the spool is full, drop + flag.
-            if self.client.spool.write(idempotency_key, body):
-                result.items_spooled += len(items)
-            else:
-                result.items_dropped += len(items)
+            self._spool_or_drop(idempotency_key, body, len(items), result)
             return
+
         if status == 200:
             result.batches_sent += 1
             result.items_accepted += len(items)
         elif status == 207:
             result.batches_sent += 1
-            accepted = len(payload.get("accepted_items", []))
-            rejected = len(payload.get("rejected_items", []))
-            result.items_accepted += accepted
-            result.items_rejected += rejected
-        else:  # terminal 4xx (400/401/403/413/422): not retryable, data dropped
+            result.items_accepted += len(payload.get("accepted_items", []))
+            result.items_rejected += len(payload.get("rejected_items", []))
+        elif status in (401, 403):
+            # Bad/revoked key or wrong scope: surface it, stop shipping, and keep
+            # the (encrypted) batch spooled for after it's fixed — never drop it.
+            self._on_auth_failure(f"/v1/batches {status}")
+            self._spool_or_drop(idempotency_key, body, len(items), result)
+        else:  # 400 / 413 / 422: bad data, won't fix on retry → drop
             result.items_dropped += len(items)
+
+    def _spool_or_drop(
+        self, idempotency_key: str, body: dict[str, Any], count: int, result: DrainResult
+    ) -> None:
+        if self.client.spool.write(idempotency_key, body):
+            result.items_spooled += count
+        else:
+            result.items_dropped += count  # spool full — data lost
+
+    def _on_auth_failure(self, detail: str) -> None:
+        if not self._auth_failed:
+            self.client.emit_diagnostic("auth_failure", detail=detail, severity="error")
+        self._auth_failed = True
 
     def _post_with_retry(
         self, body: dict[str, Any], idempotency_key: str

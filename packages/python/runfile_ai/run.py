@@ -172,6 +172,10 @@ def _drop_run_overflow(inst: Any, run: Run) -> None:
     )
     # Append directly (bypass the dropped-run guard) so the failure is visible.
     inst.buffer.append(BufferedEvent(event=diagnostic, raw_payload=None, run=run))
+    # Also surface on the diagnostics channel (callback/observability).
+    inst.emit_diagnostic(
+        "run_dropped_overflow", detail=f"run={run.run_id} dropped_events={removed}"
+    )
 
 
 # --------------------------------------------------------------------------- #
