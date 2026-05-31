@@ -7,7 +7,30 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
+import runfile_ai
+from runfile_ai import context as _ctx
 from tests.fake_ingest import FakeIngest
+
+VALID_TEST_KEY = "rf_test_" + "a" * 32
+
+
+@pytest.fixture(autouse=True)
+def _reset_sdk() -> Iterator[None]:
+    """Tear down any global SDK instance and ambient context after each test."""
+    yield
+    runfile_ai.shutdown()
+    _ctx._current_run.set(None)
+    _ctx._current_parent_event.set(None)
+    _ctx._current_parallel_group.set(None)
+
+
+@pytest.fixture
+def sdk() -> Iterator[runfile_ai.RunfileClient]:
+    """An initialised SDK instance (no flusher running; base_url unused for hot-path)."""
+    inst = runfile_ai.init(
+        api_key=VALID_TEST_KEY, environment="production", base_url="http://localhost:9"
+    )
+    yield inst
 
 
 @pytest.fixture

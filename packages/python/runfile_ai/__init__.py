@@ -25,11 +25,12 @@ from __future__ import annotations
 
 from ._constants import SDK_NAME, sdk_version
 from .client import RunfileClient, flush, init, shutdown
-from .context import current_run, parallel_group
+from .context import current_run
 from .run import (
     abandon_run,
     capture_event,
     end_run,
+    parallel_group,
     resume_run,
     run,
     start_run,

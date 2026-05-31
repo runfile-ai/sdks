@@ -23,6 +23,10 @@ SDK_NAME = "runfile-ai"
 # header). Patch is omitted — the Ingest API routes on major.minor only.
 SCHEMA_VERSION = "1.0"
 
+# Full semver written into each run/event's `schema_version` field (the schema
+# requires X.Y.Z there, distinct from the major.minor wire header above).
+SCHEMA_VERSION_FULL = "1.0.0"
+
 # Default regional Ingest API base URL.
 DEFAULT_REGION = "eu-west-2"
 DEFAULT_BASE_URL = "https://api.eu-west-2.runfile.ai"

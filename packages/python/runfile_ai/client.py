@@ -13,9 +13,16 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+import httpx
+
 from ._constants import DEFAULT_BASE_URL, DEFAULT_REGION
+from .buffer import EventBuffer
+from .datakey import DataKeyCache
 
 _API_KEY_RE = re.compile(r"^rf_(live|test)_[a-z0-9]{32}$")
+
+# Default redaction policy version until GET /v1/policies/current is wired.
+_DEFAULT_POLICY_VERSION = "0.0.0"
 
 _instance: Optional["RunfileClient"] = None
 
@@ -37,10 +44,22 @@ class RunfileClient:
         self.api_key = api_key
         self.environment = environment
         self.region = region
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.disabled = disabled
-        # TODO: construct httpx.AsyncClient, EventBuffer, Spool, DataKeyCache,
-        # PolicyCache; start the background flusher; register atexit drain.
+
+        # Redaction policy version stamped on runs/events. Populated by the
+        # policy fetch (later slice); a safe default until then.
+        self.redaction_policy_version = _DEFAULT_POLICY_VERSION
+
+        # Shared sync HTTP client (the flusher's transport). The SDK holds no AWS
+        # credentials — only the bearer API key.
+        self._http = httpx.Client(timeout=10.0)
+        self.buffer = EventBuffer()
+        self.datakeys = DataKeyCache(
+            client=self._http, base_url=self.base_url, api_key=self.api_key
+        )
+        # TODO (next slice): construct Spool + PolicyCache, start the background
+        # flusher thread, and register an atexit best-effort final drain.
 
     def flush(self) -> None:
         """Force a buffer drain. Synchronous: blocks until in-flight batches complete.
@@ -52,8 +71,10 @@ class RunfileClient:
         raise NotImplementedError
 
     def shutdown(self) -> None:
-        """Graceful shutdown: final drain, then release resources (sync)."""
-        raise NotImplementedError
+        """Graceful shutdown: (final drain — next slice), then release resources."""
+        # TODO (next slice): signal + join the flusher and final-drain the buffer.
+        self.datakeys.zeroize()
+        self._http.close()
 
 
 def init(
