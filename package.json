@@ -1,0 +1,28 @@
+{
+  "name": "@runfile-ai/sdks",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runfile open-source SDKs and customer-facing tooling: Python SDK, TypeScript SDK, and the Verifier CLI.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "clean": "pnpm -r run clean",
+    "changeset": "changeset",
+    "changeset:version": "changeset version",
+    "changeset:publish": "pnpm run build && changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.7.0",
+    "@changesets/cli": "^2.31.0",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.3",
+    "vitest": "^2.0.0"
+  }
+}

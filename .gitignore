@@ -1,0 +1,26 @@
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Go
+/packages/verifier-cli/bin/
+*.test
+
+# Tooling / OS
+.DS_Store
+.env
+.env.*
+coverage/
+.runfile/

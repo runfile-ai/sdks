@@ -1,0 +1,40 @@
+{
+  "name": "@runfile-ai/sdk",
+  "version": "0.0.1",
+  "description": "Runfile SDK — tamper-evident audit capture for AI agents (LangGraph.js, Claude Agent SDK, Mastra, Vercel AI SDK, MCP).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./integrations/langgraph": "./dist/integrations/langgraph.js",
+    "./integrations/anthropic": "./dist/integrations/anthropic.js",
+    "./integrations/openai-agents": "./dist/integrations/openai-agents.js",
+    "./integrations/mastra": "./dist/integrations/mastra.js",
+    "./integrations/vercel-ai-sdk": "./dist/integrations/vercel-ai-sdk.js",
+    "./integrations/mcp": "./dist/integrations/mcp.js"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "lint": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@runfile-ai/schemas": "^0.5.0",
+    "undici": "^6.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.3",
+    "vitest": "^2.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
