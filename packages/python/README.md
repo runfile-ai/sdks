@@ -20,6 +20,22 @@ graph = runfile_langgraph.instrument(
 )
 ```
 
+### Configuration
+
+Explicit args take precedence over environment variables, which take precedence
+over defaults:
+
+| Arg | Env var | Default |
+|-----|---------|---------|
+| `api_key` | `RUNFILE_API_KEY` | — (required) |
+| `region` | `RUNFILE_REGION` | `eu-west-2` |
+| `environment` | `RUNFILE_ENVIRONMENT` | `production` |
+| `disabled` | `RUNFILE_DISABLED` | `false` |
+
+`base_url` is derived as `https://api.<region>.runfile.ai` unless overridden.
+`RUNFILE_DISABLED=1` makes the SDK a silent no-op (handy for local dev). So
+`runfile_ai.init()` with `RUNFILE_API_KEY` set is enough.
+
 - **Import name:** `runfile_ai` (distribution: `runfile-ai`).
 - **Wire `sdk.name`:** `runfile-ai`.
 - **Python:** 3.11+.

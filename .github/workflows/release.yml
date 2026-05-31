@@ -1,11 +1,27 @@
 name: Release
 
-# TypeScript (@runfile-ai/sdk) → npm via changesets.
-# Python (runfile-ai) → PyPI via trusted publishing (OIDC, no token).
-# Verifier CLI → cross-platform binaries attached to a GitHub Release on tag.
+# Changeset-driven, no manual tagging (same model as the schemas repo).
 #
-# On push to main: if changesets are pending, open/update the "Version Packages"
-# PR. When merged (no changesets remain), publish the TS package and tag.
+# The Python (`runfile-ai`) and TypeScript (`@runfile-ai/sdk`) SDKs ship as one
+# product at one shared version: `changeset version` bumps the TS package and
+# scripts/sync-python-version.mjs copies that version into pyproject.toml, so a
+# single changeset drives both.
+#
+# The TS SDK (@runfile-ai/sdk) is held PRIVATE for now (adapters still in progress)
+# so it does NOT publish to npm yet — but changesets still version-bumps it, which
+# is what drives the shared version. Only Python ships at the moment.
+#
+# On push to main:
+#   - pending changesets  → the action opens/updates a "Version Packages" PR
+#     (bumps the version, syncs pyproject.toml, writes CHANGELOGs).
+#   - otherwise → build the Python wheel/sdist and push to PyPI via trusted
+#     publishing (OIDC, no token), with skip-existing so the upload only happens
+#     when the changeset-bumped version isn't already on PyPI.
+#
+# When the TS SDK is ready: drop `"private": true` from packages/typescript/
+# package.json and it starts publishing to npm on the same release.
+#
+# Verifier CLI stays tag-triggered (`verifier-cli/v*`).
 
 on:
   push:
@@ -14,59 +30,76 @@ on:
       - 'verifier-cli/v*'
 
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
+  contents: write       # push the version-bump commit + tags
+  pull-requests: write  # open/update the "Version Packages" PR
+  id-token: write       # OIDC for PyPI trusted publishing
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  npm:
-    if: startsWith(github.ref, 'refs/tags/') == false
+  release:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # PyPI trusted publishing verifies the GitHub OIDC token against the publisher
+    # configured at pypi.org/manage/account/publishing for `runfile-ai`:
+    #   owner=runfile-ai, repo=sdks, workflow=release.yml, environment=release.
+    environment:
+      name: release
+      url: https://pypi.org/project/runfile-ai/
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # full history so changesets can build changelogs
+
+      # Version comes from package.json "packageManager" (pnpm@9.12.0); passing it
+      # here too makes action-setup@v4 error with ERR_PNPM_BAD_PM_VERSION.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: changesets/action@v1
+      - uses: actions/setup-python@v5
         with:
+          python-version: '3.11'
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
+      - run: pnpm test
+
+      - name: Create Version PR or publish (npm)
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          # version: open/update the Version PR (bumps TS + syncs pyproject).
+          # publish: when no changesets remain, ship TS to npm + push the git tag.
           version: pnpm run changeset:version
           publish: pnpm run changeset:publish
+          commit: 'chore(release): version packages'
+          title: 'chore(release): version packages'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  pypi:
-    # Trusted publishing matches the workflow + environment configured at
-    # pypi.org/manage/account/publishing/ for the `runfile-ai` project.
-    if: startsWith(github.ref, 'refs/tags/') == false
-    runs-on: ubuntu-latest
-    environment:
-      name: release
-      url: https://pypi.org/project/runfile-ai/
-    defaults:
-      run:
-        working-directory: packages/python
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install build
-      - run: python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # ----- PyPI: publish runfile-ai whenever its version is new -------------
+      # NOT gated on the npm publish: @runfile-ai/sdk is private, so changesets
+      # publishes nothing to npm and `published` is false. We always build and let
+      # skip-existing decide — PyPI uploads only when pyproject's version (bumped
+      # via changesets + scripts/sync-python-version.mjs) isn't already published,
+      # i.e. right after a "Version Packages" PR merges (and on the first release).
+      - name: Install Python build tooling
+        run: pip install build
+
+      - name: Build runfile-ai wheel + sdist
+        run: python -m build packages/python
+
+      - name: Publish runfile-ai to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: packages/python/dist
+          skip-existing: true
+          # Trusted publishing — no `password:` on purpose.
 
   verifier-cli:
     if: startsWith(github.ref, 'refs/tags/verifier-cli/v')

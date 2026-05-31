@@ -25,14 +25,14 @@ The SDKs depend on the published schema packages, **not** path links:
 When a schema field is needed, bump the dependency to the released schema
 version — don't reach into the schemas repo.
 
-### Open follow-up: wire `sdk.name`
+### Wire `sdk.name`
 
 The SDKs report `sdk.name = "runfile-ai"` (Python) and `"@runfile-ai/sdk"` (TS)
-on every event. The schema's `SdkNameEnum` (and the Ingest API
-`Runfile-SDK-Name` header enum) must include these values. Until the schema is
-updated + regenerated + the Ingest/Event-Processor validators redeployed, real
-batches from these SDKs will be rejected at validation. Track this with the
-schemas repo before the first SDK release. See `packages/*/…/constants`.
+on every event. These values are in the deployed schema's `SdkNameEnum`
+(`@runfile-ai/schemas` >= 0.6.0) and accepted by the live Ingest validator, so
+real batches are accepted. If you ever change these wire identifiers, update
+`SdkNameEnum` in the schemas repo, regenerate, and redeploy the Ingest /
+Event-Processor validators first. See `packages/*/…/constants`.
 
 ## Versioning
 

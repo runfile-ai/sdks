@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "runfile-ai"
-version = "0.0.1"
+version = "0.1.0"
 description = "Runfile SDK — tamper-evident audit capture for AI agents (LangGraph, OpenAI Agents, Claude Agent SDK, MCP)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,10 @@ Source = "https://github.com/runfile-ai/sdks"
 [project.optional-dependencies]
 langgraph = ["langgraph>=0.2"]
 openai-agents = ["openai-agents>=0.1"]
-anthropic = ["claude-agent-sdk>=0.1"]
+# >=0.1.29: first release with the Notification, SubagentStart, and
+# PermissionRequest hook events (PostToolUseFailure landed in 0.1.26). Older
+# installs silently ignore unknown hook keys, so the adapter version-checks too.
+anthropic = ["claude-agent-sdk>=0.1.29"]
 mcp = ["mcp>=1.0"]
 dev = [
   "pytest>=8.0",
@@ -44,6 +47,24 @@ line-length = 100
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+# runfile-ai-schemas (generated) ships models but no py.typed marker yet.
+# TODO: drop this once the schemas repo adds py.typed to the generated package.
+[[tool.mypy.overrides]]
+module = "runfile_schemas.*"
+ignore_missing_imports = true
+
+# Optional framework SDKs — imported lazily inside adapters, never required to
+# install or type-check the core. (Each is an extra in [project.optional-dependencies].)
+[[tool.mypy.overrides]]
+module = [
+  "claude_agent_sdk.*",
+  "langgraph.*",
+  "langchain_core.*",
+  "agents.*",
+  "mcp.*",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
