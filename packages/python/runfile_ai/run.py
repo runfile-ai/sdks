@@ -136,6 +136,8 @@ def _emit_event(
     """
     if run.dropped:
         return ""
+    if _require_instance().disabled:
+        return ""  # disabled SDK: silent no-op
     event_id, event = _build_event(run, kind=kind, name=name, actor=actor, **extra)
     _buffer_append(run, BufferedEvent(event=event, raw_payload=payload, run=run))
     set_parent_event(event_id)
@@ -151,8 +153,8 @@ def _buffer_append(run: Run, item: Any) -> None:
     atomically (never mid-run events) and emit a loud ``sdk_diagnostic``.
     """
     inst = _require_instance()
-    if run.dropped:
-        return
+    if inst.disabled or run.dropped:
+        return  # disabled SDK: silent no-op; dropped run: already abandoned
     inst.buffer.append(item)
     if len(inst.buffer) >= inst.buffer.soft_cap:
         if inst.capture_blocking:

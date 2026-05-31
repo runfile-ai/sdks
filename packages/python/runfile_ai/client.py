@@ -170,13 +170,17 @@ class RunfileClient:
         self._http.close()
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def init(
-    api_key: str,
+    api_key: str | None = None,
     *,
-    environment: str = "production",
-    region: str = DEFAULT_REGION,
+    environment: str | None = None,
+    region: str | None = None,
     base_url: str | None = None,
-    disabled: bool = False,
+    disabled: bool | None = None,
     start_flusher: bool = True,
     fetch_policy: bool = True,
     spool_dir: str | os.PathLike[str] | None = None,
@@ -186,19 +190,39 @@ def init(
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance).
 
+    Configuration precedence is **explicit arg > environment variable > default**:
+
+    - ``api_key``        ← ``RUNFILE_API_KEY``
+    - ``region``         ← ``RUNFILE_REGION``      (default ``eu-west-2``)
+    - ``environment``    ← ``RUNFILE_ENVIRONMENT`` (default ``production``)
+    - ``disabled``       ← ``RUNFILE_DISABLED``    (``1``/``true``/``yes``/``on``)
+    - ``spool_dir``      ← ``RUNFILE_SPOOL_DIR``
+
     ``base_url`` defaults to ``https://api.<region>.runfile.ai``; pass it only to
     target a non-standard host. ``on_diagnostic`` receives SDK health records
     (policy-refresh failure, auth failure, overflow drops); default is silent.
+    When disabled the SDK becomes a no-op (capture is silently dropped).
     """
     global _instance
     if _instance is not None:
         return _instance
+
+    resolved_disabled = disabled if disabled is not None else _env_truthy("RUNFILE_DISABLED")
+    resolved_api_key = api_key or os.environ.get("RUNFILE_API_KEY")
+    if not resolved_api_key and not resolved_disabled:
+        raise ValueError(
+            "api_key is required: pass api_key=... or set RUNFILE_API_KEY "
+            "(or set RUNFILE_DISABLED=1 to run the SDK as a no-op)"
+        )
+    resolved_region = region or os.environ.get("RUNFILE_REGION") or DEFAULT_REGION
+    resolved_environment = environment or os.environ.get("RUNFILE_ENVIRONMENT") or "production"
+
     _instance = RunfileClient(
-        api_key,
-        environment=environment,
-        region=region,
+        resolved_api_key or "",
+        environment=resolved_environment,
+        region=resolved_region,
         base_url=base_url,
-        disabled=disabled,
+        disabled=resolved_disabled,
         start_flusher=start_flusher,
         fetch_policy=fetch_policy,
         spool_dir=spool_dir,
