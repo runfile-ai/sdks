@@ -42,12 +42,17 @@ class RunfileClient:
         # TODO: construct httpx.AsyncClient, EventBuffer, Spool, DataKeyCache,
         # PolicyCache; start the background flusher; register atexit drain.
 
-    async def flush(self) -> None:
-        """Force a synchronous buffer drain. Blocks until in-flight batches complete."""
+    def flush(self) -> None:
+        """Force a buffer drain. Synchronous: blocks until in-flight batches complete.
+
+        Per sdk-design.md the Python public surface is synchronous and the flusher
+        runs on a background thread; ``flush()`` signals that thread and joins on
+        the in-flight batches.
+        """
         raise NotImplementedError
 
-    async def shutdown(self) -> None:
-        """Graceful shutdown: final drain, then release resources."""
+    def shutdown(self) -> None:
+        """Graceful shutdown: final drain, then release resources (sync)."""
         raise NotImplementedError
 
 
@@ -78,13 +83,15 @@ def get_instance() -> Optional[RunfileClient]:
     return _instance
 
 
-async def flush() -> None:
+def flush() -> None:
+    """Force a synchronous buffer drain on the active instance."""
     if _instance is not None:
-        await _instance.flush()
+        _instance.flush()
 
 
-async def shutdown() -> None:
+def shutdown() -> None:
+    """Graceful shutdown of the active instance."""
     global _instance
     if _instance is not None:
-        await _instance.shutdown()
+        _instance.shutdown()
         _instance = None

@@ -45,5 +45,11 @@ line-length = 100
 python_version = "3.11"
 strict = true
 
+# runfile-ai-schemas (generated) ships models but no py.typed marker yet.
+# TODO: drop this once the schemas repo adds py.typed to the generated package.
+[[tool.mypy.overrides]]
+module = "runfile_schemas.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
