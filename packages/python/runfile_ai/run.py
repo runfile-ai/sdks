@@ -243,7 +243,12 @@ def resume_run(
     event_id = _emit_event(run, kind="run_resume", name="resume", resume_details=details)
     inst.buffer.append(
         BufferedRunItem(
-            item={"type": "run_update", "run_id": run.run_id, "lifecycle_state": "active"},
+            item={
+                "type": "run_update",
+                "run_id": run.run_id,
+                "lifecycle_state": "active",
+                "triggered_by_event_id": event_id,
+            },
             run=run,
         )
     )
@@ -260,7 +265,12 @@ def abandon_run(*, reason: Optional[str] = None, run_id: Optional[str] = None) -
     event_id = _emit_event(run, kind="run_abandon", name=reason or "abandon")
     inst.buffer.append(
         BufferedRunItem(
-            item={"type": "run_update", "run_id": run.run_id, "lifecycle_state": "ended"},
+            item={
+                "type": "run_update",
+                "run_id": run.run_id,
+                "lifecycle_state": "ended",
+                "triggered_by_event_id": event_id,
+            },
             run=run,
         )
     )

@@ -34,6 +34,10 @@ class FakeIngest:
     batch_count: int = 0
     #: Queue of HTTP statuses to return from POST /v1/data-keys before succeeding.
     datakey_fail_statuses: list[int] = field(default_factory=list)
+    #: Queue of HTTP statuses to return from POST /v1/batches before succeeding.
+    batch_fail_statuses: list[int] = field(default_factory=list)
+    #: When True, the next /v1/batches returns 207 with one rejected item.
+    batch_return_207: bool = False
     policy_version: str = "3.2.1"
     _server: ThreadingHTTPServer | None = None
     _thread: threading.Thread | None = None
@@ -117,10 +121,30 @@ def _make_handler(state: FakeIngest) -> type[BaseHTTPRequestHandler]:
                     "algorithm": "aes-256-gcm",
                 })
             elif self.path == "/v1/batches":
-                state.batch_count += 1
+                if state.batch_fail_statuses:
+                    status = state.batch_fail_statuses.pop(0)
+                    self._send(status, {"error_code": "service_unavailable",
+                                        "error_message": "forced failure"})
+                    return
+                batch_id = (body or {}).get("batch_id", "b_unknown")
                 items = (body or {}).get("items", [])
+                if state.batch_return_207:
+                    state.batch_return_207 = False
+                    state.batch_count += 1
+                    self._send(207, {
+                        "batch_id": batch_id,
+                        "accepted_count": max(len(items) - 1, 0),
+                        "rejected_count": 1,
+                        "accepted_items": [],
+                        "rejected_items": [{"type": "event", "id": "x",
+                                            "error_code": "schema_validation_failed",
+                                            "error_message": "forced"}],
+                        "received_at": "2026-05-31T00:00:00.000Z",
+                    })
+                    return
+                state.batch_count += 1
                 self._send(200, {
-                    "batch_id": (body or {}).get("batch_id", "b_unknown"),
+                    "batch_id": batch_id,
                     "accepted_count": len(items),
                     "accepted_items": [],
                     "received_at": "2026-05-31T00:00:00.000Z",

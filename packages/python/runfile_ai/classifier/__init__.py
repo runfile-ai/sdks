@@ -35,11 +35,20 @@ PII_CLASSES = (
 
 class Classifier:
     def classify(self, payload: Any) -> Any:
-        """Annotate the payload with detected PII spans/classes."""
-        raise NotImplementedError
+        """Annotate the payload with detected PII spans/classes.
+
+        v1 slice: pass-through (no detection yet). Real regex/heuristic
+        classification across :data:`PII_CLASSES` lands in a dedicated slice.
+        """
+        return payload
 
 
 class Redactor:
     def apply(self, classified: Any, policy: Any) -> Any:
-        """Apply the policy treatment (drop/tokenize/hash/pass_through) per class."""
-        raise NotImplementedError
+        """Apply the policy treatment (drop/tokenize/hash/pass_through) per class.
+
+        v1 slice: pass-through. The treatment engine (drop/tokenize-via-Vault/
+        hash/pass_through/tokenize_with_fallback) lands with the classifier.
+        """
+        return classified
+

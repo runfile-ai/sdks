@@ -28,7 +28,10 @@ def _reset_sdk() -> Iterator[None]:
 def sdk() -> Iterator[runfile_ai.RunfileClient]:
     """An initialised SDK instance (no flusher running; base_url unused for hot-path)."""
     inst = runfile_ai.init(
-        api_key=VALID_TEST_KEY, environment="production", base_url="http://localhost:9"
+        api_key=VALID_TEST_KEY,
+        environment="production",
+        base_url="http://localhost:9",
+        start_flusher=False,  # deterministic: hot-path tests inspect the buffer
     )
     yield inst
 

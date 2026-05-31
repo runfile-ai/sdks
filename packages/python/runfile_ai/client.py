@@ -38,6 +38,7 @@ class RunfileClient:
         region: str = DEFAULT_REGION,
         base_url: str = DEFAULT_BASE_URL,
         disabled: bool = False,
+        start_flusher: bool = True,
     ) -> None:
         if not disabled and not _API_KEY_RE.match(api_key):
             raise ValueError("invalid API key shape; expected rf_<live|test>_<32 base32 chars>")
@@ -58,21 +59,24 @@ class RunfileClient:
         self.datakeys = DataKeyCache(
             client=self._http, base_url=self.base_url, api_key=self.api_key
         )
-        # TODO (next slice): construct Spool + PolicyCache, start the background
-        # flusher thread, and register an atexit best-effort final drain.
+
+        # Background flusher (chain → encrypt → ship). Importing here avoids a
+        # module-level import cycle (flusher type-checks against this class).
+        from .flusher import Flusher
+
+        self._flusher = Flusher(client=self)
+        if start_flusher and not disabled:
+            self._flusher.start()
+        # TODO (next slice): Spool (ciphertext-only disk durability), PolicyCache
+        # (GET /v1/policies/current), and an atexit best-effort final drain.
 
     def flush(self) -> None:
-        """Force a buffer drain. Synchronous: blocks until in-flight batches complete.
-
-        Per sdk-design.md the Python public surface is synchronous and the flusher
-        runs on a background thread; ``flush()`` signals that thread and joins on
-        the in-flight batches.
-        """
-        raise NotImplementedError
+        """Force a synchronous buffer drain. Blocks until the in-flight batches ship."""
+        self._flusher.flush_now()
 
     def shutdown(self) -> None:
-        """Graceful shutdown: (final drain — next slice), then release resources."""
-        # TODO (next slice): signal + join the flusher and final-drain the buffer.
+        """Graceful shutdown: stop + final-drain the flusher, then release resources."""
+        self._flusher.stop()
         self.datakeys.zeroize()
         self._http.close()
 
@@ -84,6 +88,7 @@ def init(
     region: str = DEFAULT_REGION,
     base_url: str = DEFAULT_BASE_URL,
     disabled: bool = False,
+    start_flusher: bool = True,
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance)."""
     global _instance
@@ -95,6 +100,7 @@ def init(
         region=region,
         base_url=base_url,
         disabled=disabled,
+        start_flusher=start_flusher,
     )
     return _instance
 
