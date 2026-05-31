@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -60,13 +61,23 @@ _BATCH_ENVELOPE_OVERHEAD = 1024
 _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
+#: ±25% backoff jitter (spec) to avoid synchronized retries (thundering herd).
+_JITTER = 0.25
+
+
+def _default_jitter() -> float:
+    """A random multiplier in [0.75, 1.25] applied to each backoff delay."""
+    return 1.0 + random.uniform(-_JITTER, _JITTER)
+
+
 @dataclass
 class RetryConfig:
     base_ms: int = 200
     cap_ms: int = 30_000
     max_attempts: int = 8
     sleep: Callable[[float], None] = time.sleep
-    jitter: Callable[[], float] = lambda: 1.0  # overridable in tests; 1.0 = no jitter
+    # ±25% jitter by default; injectable (e.g. a constant) for deterministic tests.
+    jitter: Callable[[], float] = _default_jitter
 
 
 @dataclass
@@ -343,9 +354,10 @@ class Flusher:
         raise _ShipError(f"exhausted retries: {last_exc}")
 
     def _backoff_seconds(self, attempt: int) -> float:
-        millis = min(self.retry.base_ms * (2**attempt), self.retry.cap_ms)
-        jitter: float = self.retry.jitter()
-        return float(millis * jitter / 1000.0)
+        base_ms = min(self.retry.base_ms * (2**attempt), self.retry.cap_ms)
+        jittered_ms: float = base_ms * self.retry.jitter()
+        clamped_ms: float = min(jittered_ms, float(self.retry.cap_ms))  # hard ceiling
+        return clamped_ms / 1000.0
 
 
 class _ShipError(RuntimeError):
