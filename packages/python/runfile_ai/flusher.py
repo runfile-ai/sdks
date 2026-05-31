@@ -49,8 +49,12 @@ if TYPE_CHECKING:
 # tenant is resolved server-side from the bearer key.
 _SELF_TENANT = "self"
 
-# Wire limit: 100 items per batch (the 5 MB cap is enforced separately later).
+# Wire limits: 100 items OR 5 MB per batch, whichever comes first.
 _MAX_ITEMS_PER_BATCH = 100
+_MAX_BATCH_BYTES = 5 * 1024 * 1024
+# Headroom for the batch envelope ({"batch_id":"b_…","items":[…]}) + safety so we
+# stay under API Gateway's 5 MB body limit (413) even after JSON whitespace.
+_BATCH_ENVELOPE_OVERHEAD = 1024
 
 _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
@@ -79,6 +83,8 @@ class Flusher:
     client: "RunfileClient"
     interval_seconds: float = 2.0
     retry: RetryConfig = field(default_factory=RetryConfig)
+    max_items_per_batch: int = _MAX_ITEMS_PER_BATCH
+    max_batch_bytes: int = _MAX_BATCH_BYTES
 
     _last_event_hash: dict[str, str] = field(default_factory=dict)
     _drain_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -130,9 +136,36 @@ class Flusher:
             if not items:
                 return result
             wire_items = [self._to_wire_item(item, result) for item in items]
-            for chunk in _chunks(wire_items, _MAX_ITEMS_PER_BATCH):
+            for chunk in self._chunk_batches(wire_items):
                 self._ship_batch(chunk, result)
             return result
+
+    def _chunk_batches(self, items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Split items into batches under both the item-count and 5 MB byte caps.
+
+        Greedy/FIFO: preserves order (so each run's items stay in sequence). A
+        single item larger than the byte budget is isolated in its own batch — it
+        will 413 server-side, but only that one item is lost, not its neighbours.
+        """
+        budget = self.max_batch_bytes - _BATCH_ENVELOPE_OVERHEAD
+        batches: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_bytes = 0
+        for item in items:
+            # Measure with default (spaced) JSON so we over- rather than
+            # under-estimate the bytes the HTTP client will actually send.
+            item_bytes = len(json.dumps(item).encode("utf-8")) + 1  # +1 for the comma
+            too_many = len(current) >= self.max_items_per_batch
+            too_big = current_bytes + item_bytes > budget
+            if current and (too_many or too_big):
+                batches.append(current)
+                current = []
+                current_bytes = 0
+            current.append(item)
+            current_bytes += item_bytes
+        if current:
+            batches.append(current)
+        return batches
 
     def _drain_spool(self, result: DrainResult) -> None:
         """Re-send spooled batches (ciphertext only) with their original keys."""
@@ -312,10 +345,6 @@ def _serialize(payload: Any) -> tuple[bytes, str]:
     if isinstance(payload, str):
         return payload.encode("utf-8"), "text/plain"
     return json.dumps(payload, separators=(",", ":")).encode("utf-8"), "application/json"
-
-
-def _chunks(items: list[Any], size: int) -> list[list[Any]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 def _uuid4() -> str:

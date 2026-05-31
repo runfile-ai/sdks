@@ -142,6 +142,43 @@ def test_invalid_event_is_shipped_not_dropped(fake_ingest: FakeIngest) -> None:
     assert "llm_call" in kinds  # present despite being locally invalid
 
 
+def test_batch_size_cap_splits_batches(fake_ingest: FakeIngest) -> None:
+    # With a tiny byte cap, sizeable events must split across multiple batches,
+    # each under the cap, with no items lost.
+    inst = _init(fake_ingest)
+    inst._flusher.max_batch_bytes = 4096
+    big = {"prompt": "x" * 1500}
+    with runfile_ai.run(agent_identity=AGENT):
+        for i in range(4):
+            runfile_ai.capture_event(
+                kind="llm_call",
+                name=f"call{i}",
+                payload=big,
+                model_ref={"provider": "anthropic", "model_id": "claude-opus-4-8"},
+            )
+    runfile_ai.flush()
+
+    posts = _batch_posts(fake_ingest)
+    assert len(posts) >= 2  # split by the byte cap, not the 100-item cap
+    for body in posts:
+        assert len(json.dumps(body).encode("utf-8")) <= inst._flusher.max_batch_bytes
+    # all 6 items delivered (run_create + 4 events + run_end), none dropped
+    assert sum(len(b["items"]) for b in posts) == 6
+
+
+def test_item_count_cap_splits_batches(fake_ingest: FakeIngest) -> None:
+    inst = _init(fake_ingest)
+    inst._flusher.max_items_per_batch = 3
+    with runfile_ai.run(agent_identity=AGENT):
+        for i in range(7):
+            runfile_ai.capture_event(kind="tool_call", name=f"t{i}")
+    runfile_ai.flush()
+
+    posts = _batch_posts(fake_ingest)
+    assert all(len(b["items"]) <= 3 for b in posts)
+    assert sum(len(b["items"]) for b in posts) == 9  # run_create + 7 events + run_end
+
+
 def test_background_thread_drains(fake_ingest: FakeIngest) -> None:
     import time
 
