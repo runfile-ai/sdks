@@ -82,6 +82,16 @@ class EventBuffer:
             self._items = []
             return items
 
+    def requeue_front(self, items: list[BufferedItem]) -> None:
+        """Put items back at the FRONT, preserving capture order.
+
+        Used when a drain can't process items (e.g. the data-key endpoint is
+        unreachable, so payloads can't be encrypted): they wait in memory for the
+        next drain rather than being dropped or spooled as plaintext.
+        """
+        with self._lock:
+            self._items = list(items) + self._items
+
     def drop_run(self, run_id: str) -> int:
         """Remove all buffered items for one run (overflow whole-run drop).
 

@@ -41,6 +41,7 @@ from ._hashing import ZERO_SENTINEL, compute_event_hash
 from ._ids import generate_batch_id
 from .buffer import BufferedEvent, BufferedItem, BufferedRunItem
 from .classifier import CLASSIFIER_VERSION
+from .datakey import DataKeyError
 
 if TYPE_CHECKING:
     from .client import RunfileClient
@@ -75,6 +76,7 @@ class DrainResult:
     items_rejected: int = 0
     items_invalid: int = 0  # failed LOCAL validation but shipped raw (chain-preserving)
     items_spooled: int = 0  # retries exhausted → persisted to disk for a later drain
+    items_deferred: int = 0  # couldn't encrypt (no data key) → held in memory, retried
     items_dropped: int = 0  # terminal 4xx, or spool full (data lost)
 
 
@@ -135,7 +137,19 @@ class Flusher:
             items = self.client.buffer.take_all()
             if not items:
                 return result
-            wire_items = [self._to_wire_item(item, result) for item in items]
+            wire_items: list[dict[str, Any]] = []
+            for idx, item in enumerate(items):
+                try:
+                    wire_items.append(self._to_wire_item(item, result))
+                except DataKeyError:
+                    # Can't encrypt without a data key. NEVER spool plaintext and
+                    # NEVER drop — hold the unprocessed items in memory and retry
+                    # on the next drain (data-key failure-mode #2). Defer this item
+                    # and everything after it so per-run order / chaining is kept.
+                    deferred = items[idx:]
+                    self.client.buffer.requeue_front(deferred)
+                    result.items_deferred += len(deferred)
+                    break
             for chunk in self._chunk_batches(wire_items):
                 self._ship_batch(chunk, result)
             return result
@@ -339,12 +353,17 @@ class _ShipError(RuntimeError):
 
 
 def _serialize(payload: Any) -> tuple[bytes, str]:
-    """Serialize a redacted payload to bytes + a wire content_type."""
+    """Serialize a redacted payload to bytes + a wire content_type.
+
+    Total: ``default=str`` coerces anything not natively JSON-serializable
+    (datetimes, custom objects) so serialization never raises — otherwise an
+    unhandled error here would lose the already-drained buffer.
+    """
     if isinstance(payload, bytes):
         return payload, "application/json"
     if isinstance(payload, str):
         return payload.encode("utf-8"), "text/plain"
-    return json.dumps(payload, separators=(",", ":")).encode("utf-8"), "application/json"
+    return json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"), "application/json"
 
 
 def _uuid4() -> str:

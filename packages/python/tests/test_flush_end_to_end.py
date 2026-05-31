@@ -179,6 +179,46 @@ def test_item_count_cap_splits_batches(fake_ingest: FakeIngest) -> None:
     assert sum(len(b["items"]) for b in posts) == 9  # run_create + 7 events + run_end
 
 
+def test_datakey_unreachable_defers_not_drops(fake_ingest: FakeIngest) -> None:
+    # Data-key endpoint down → payloads can't be encrypted. Items must wait in the
+    # buffer (NOT dropped, NOT spooled as plaintext) and ship once it recovers.
+    inst = _init(fake_ingest)
+    fake_ingest.datakey_fail_statuses = [503]  # first mint fails
+
+    with runfile_ai.run(agent_identity=AGENT):
+        runfile_ai.capture_event(
+            kind="llm_call",
+            name="messages.create",
+            payload={"prompt": "secret"},
+            model_ref={"provider": "anthropic", "model_id": "claude-opus-4-8"},
+        )
+    r1 = inst._flusher.flush_now()
+
+    assert r1.items_deferred >= 1
+    assert len(inst.buffer) >= 1  # held in memory for retry
+    assert inst.spool.entries() == []  # never spooled (no plaintext to disk)
+    assert r1.items_dropped == 0  # nothing lost
+
+    # endpoint recovers → the deferred payload event ships and decrypts
+    fake_ingest.datakey_fail_statuses = []
+    inst._flusher.flush_now()
+    assert len(inst.buffer) == 0
+
+    events = [
+        it["event"]
+        for body in _batch_posts(fake_ingest)
+        for it in body["items"]
+        if it["type"] == "event"
+    ]
+    payload_events = [e for e in events if "payload_ref" in e]
+    assert payload_events  # the previously-undeliverable event made it
+    pr = payload_events[0]["payload_ref"]
+    ciphertext = base64.b64decode(pr["ciphertext_base64"])
+    nonce = base64.b64decode(pr["encryption"]["nonce"])
+    key = inst.datakeys._entries[("self", AGENT)].key.plaintext
+    assert AESGCM(bytes(key)).decrypt(nonce, ciphertext, None) == b'{"prompt":"secret"}'
+
+
 def test_background_thread_drains(fake_ingest: FakeIngest) -> None:
     import time
 
