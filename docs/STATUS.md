@@ -32,15 +32,29 @@ Until then, real batches from these SDKs are rejected at ingest validation.
 
 | Package | Scaffold | Core logic | Adapters |
 |---------|:--------:|:----------:|----------|
-| `runfile-ai` (Python) | ✅ | ⏳ | ⏳ LangGraph, OpenAI Agents, Claude SDK, MCP (v1) |
+| `runfile-ai` (Python) | ✅ | ✅ (manual API end-to-end) | ⏳ LangGraph, OpenAI Agents, Claude SDK, MCP (v1) |
 | `@runfile-ai/sdk` (TS) | ✅ | ⏳ | ⏳ LangGraph.js, Claude SDK (v1); OpenAI/Mastra/Vercel (v1.5) |
 | `runfile-verifier` (Go) | ✅ | ⏳ | n/a |
 
-## Suggested build order (per ingestion docs)
+## Python core — DONE (branch `python-sdk-core`, 57 tests, mypy --strict + ruff)
 
-1. Core: data-key fetch + cache, AES-256-GCM encrypt, event construction,
-   buffer + flusher, spool, HTTP client, idempotency, retry/backoff.
-2. Manual API end-to-end (metadata-only, then payload-bearing) against a mocked
-   Ingest API.
-3. First adapter: Python LangGraph (most documented signal surface).
-4. Remaining v1 adapters; Verifier CLI logic; examples.
+- Data-key fetch + per-(tenant,agent) cache (TTL, zeroize) · AES-256-GCM encrypt.
+- Run lifecycle + event construction (local_seq, segments, parent chaining,
+  parallel groups), manual + context-manager API.
+- Background-thread flusher: hash chain (shared canonical projection, server
+  parity), redact → encrypt → validate (Pydantic) → mixed batch → POST
+  /v1/batches with Idempotency-Key, exponential backoff, 207 handling.
+- Redaction policy fetch + cache; on-disk spool (ciphertext-only) + atexit drain;
+  buffer overflow (backpressure / whole-run drop, never mid-run); PII classifier
+  + redaction (drop/hash/pass_through; Luhn for cards).
+- Never drops an individual event (chain integrity); never writes plaintext to disk.
+
+## Remaining Python work
+
+1. **Vault tokenization** — `tokenize`/`tokenize_with_fallback` currently drop;
+   wire the Vault `/v1/tokenize` client (needs the Vault request/response contract).
+2. **Framework adapters** — LangGraph first (v1 priority), then OpenAI Agents,
+   Claude Agent SDK, MCP. The customer-facing surface.
+3. Decorators (`capture_decision`), size-based flush trigger, telemetry/logging.
+
+Then: TypeScript core (mirror), Verifier CLI logic, end-to-end examples.
