@@ -40,7 +40,7 @@ from ._constants import SCHEMA_VERSION, SDK_NAME, sdk_version
 from ._hashing import ZERO_SENTINEL, compute_event_hash
 from ._ids import generate_batch_id
 from .buffer import BufferedEvent, BufferedItem, BufferedRunItem
-from .classifier import Classifier, Redactor
+from .classifier import CLASSIFIER_VERSION, Redactor
 
 if TYPE_CHECKING:
     from .client import RunfileClient
@@ -79,7 +79,6 @@ class Flusher:
     client: "RunfileClient"
     interval_seconds: float = 2.0
     retry: RetryConfig = field(default_factory=RetryConfig)
-    classifier: Classifier = field(default_factory=Classifier)
     redactor: Redactor = field(default_factory=Redactor)
 
     _last_event_hash: dict[str, str] = field(default_factory=dict)
@@ -184,16 +183,16 @@ class Flusher:
         return wire_item
 
     def _build_payload_ref(self, item: BufferedEvent) -> dict[str, Any]:
-        classified = self.classifier.classify(item.raw_payload)
-        redacted = self.redactor.apply(classified, self.client.redaction_policy_version)
-        plaintext, content_type = _serialize(redacted)
+        # Redact (the client-side PII boundary) before encryption.
+        redaction = self.redactor.apply(item.raw_payload, self.client.current_policy())
+        plaintext, content_type = _serialize(redaction.value)
 
         from .encrypt import aes_gcm_encrypt  # local import: avoid import cycle
 
         data_key = self.client.datakeys.get_or_fetch(_SELF_TENANT, item.run.agent_identity)
         enc = aes_gcm_encrypt(plaintext, bytes(data_key.plaintext))
         digest = hashlib.sha256(enc.ciphertext).hexdigest()
-        return {
+        payload_ref: dict[str, Any] = {
             "sha256": f"sha256:{digest}",
             "size_bytes": len(enc.ciphertext),
             "encryption": {
@@ -205,6 +204,13 @@ class Flusher:
             "content_type": content_type,
             "ciphertext_base64": base64.b64encode(enc.ciphertext).decode(),
         }
+        if redaction.redacted_classes or redaction.tokenized_classes:
+            payload_ref["redaction_applied"] = {
+                "redacted_classes": redaction.redacted_classes,
+                "tokenized_classes": redaction.tokenized_classes,
+                "classifier_version": CLASSIFIER_VERSION,
+            }
+        return payload_ref
 
     @staticmethod
     def _validate_item(item: dict[str, Any]) -> dict[str, Any] | None:

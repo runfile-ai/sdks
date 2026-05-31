@@ -19,7 +19,7 @@ import httpx
 from ._constants import DEFAULT_BASE_URL, DEFAULT_REGION
 from .buffer import EventBuffer
 from .datakey import DataKeyCache
-from .policy import PolicyCache
+from .policy import PolicyCache, RedactionPolicy
 from .spool import DEFAULT_SPOOL_DIR, Spool
 
 _API_KEY_RE = re.compile(r"^rf_(live|test)_[a-z0-9]{32}$")
@@ -94,6 +94,10 @@ class RunfileClient:
     def redaction_policy_version(self) -> str:
         """Policy version stamped on runs/events (default until a policy is fetched)."""
         return self._policy_cache.version()
+
+    def current_policy(self) -> "RedactionPolicy | None":
+        """The current redaction policy (drives the flusher's redactor), if fetched."""
+        return self._policy_cache.current()
 
     def refresh_policy_if_stale(self) -> None:
         """Best-effort policy refresh, called periodically by the flusher thread."""

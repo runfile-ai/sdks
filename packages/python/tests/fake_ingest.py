@@ -39,6 +39,7 @@ class FakeIngest:
     #: When True, the next /v1/batches returns 207 with one rejected item.
     batch_return_207: bool = False
     policy_version: str = "3.2.1"
+    policy_rules: list[dict[str, Any]] = field(default_factory=list)
     _server: ThreadingHTTPServer | None = None
     _thread: threading.Thread | None = None
 
@@ -97,7 +98,7 @@ def _make_handler(state: FakeIngest) -> type[BaseHTTPRequestHandler]:
             elif self.path == "/v1/policies/current":
                 self._send(200, {
                     "policy_version": state.policy_version,
-                    "classification_rules": [],
+                    "classification_rules": state.policy_rules,
                     "fetched_at": "2026-05-31T00:00:00.000Z",
                     "ttl_seconds": 300,
                 })
