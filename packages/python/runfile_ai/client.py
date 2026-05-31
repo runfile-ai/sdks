@@ -17,10 +17,11 @@ from typing import Any, Callable, Optional
 import httpx
 
 from ._clock import utc_now_iso
-from ._constants import DEFAULT_REGION, default_base_url
+from ._constants import DEFAULT_REGION, SCHEMA_VERSION, default_base_url
 from .buffer import EventBuffer
 from .classifier import Redactor
 from .datakey import DataKeyCache
+from .health import fetch_supported_schema_versions
 from .policy import PolicyCache, RedactionPolicy
 from .spool import DEFAULT_SPOOL_DIR, Spool
 from .vault import VaultClient
@@ -53,6 +54,7 @@ class RunfileClient:
         buffer_soft_cap: int = 10_000,
         capture_blocking: bool = True,
         on_diagnostic: Callable[[Diagnostic], None] | None = None,
+        check_health: bool | None = None,
     ) -> None:
         if not disabled and not _API_KEY_RE.match(api_key):
             raise ValueError("invalid API key shape; expected rf_<live|test>_<32 base32 chars>")
@@ -83,6 +85,13 @@ class RunfileClient:
         )
         if fetch_policy and not disabled:
             self.refresh_policy_if_stale()  # best-effort; emits a diagnostic on failure
+
+        # Schema-version negotiation via GET /v1/health. Defaults to fetch_policy
+        # so "no startup network" (the offline/test posture) covers both probes.
+        self.server_schema_versions: list[str] | None = None
+        do_health = fetch_policy if check_health is None else check_health
+        if do_health and not disabled:
+            self._negotiate_schema_version()
 
         resolved_spool = spool_dir or os.environ.get("RUNFILE_SPOOL_DIR") or DEFAULT_SPOOL_DIR
         self.spool = Spool(directory=Path(resolved_spool))
@@ -121,6 +130,19 @@ class RunfileClient:
     def current_policy(self) -> "RedactionPolicy | None":
         """The current redaction policy (drives the flusher's redactor), if fetched."""
         return self._policy_cache.current()
+
+    def _negotiate_schema_version(self) -> None:
+        """Warn (but don't block) if the server doesn't support our schema version."""
+        supported = fetch_supported_schema_versions(self._http, self.base_url)
+        if supported is None:
+            return  # best-effort: /v1/health unreachable
+        self.server_schema_versions = supported
+        if SCHEMA_VERSION not in supported:
+            self.emit_diagnostic(
+                "schema_version_unsupported",
+                detail=f"server supports {supported}; SDK emits schema {SCHEMA_VERSION} "
+                "— batches will be rejected until versions align",
+            )
 
     def refresh_policy_if_stale(self) -> None:
         """Best-effort policy refresh; emits a diagnostic on failure (never raises).
@@ -191,6 +213,7 @@ def init(
     buffer_soft_cap: int = 10_000,
     capture_blocking: bool = True,
     on_diagnostic: Callable[[Diagnostic], None] | None = None,
+    check_health: bool | None = None,
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance).
 
@@ -233,6 +256,7 @@ def init(
         buffer_soft_cap=buffer_soft_cap,
         capture_blocking=capture_blocking,
         on_diagnostic=on_diagnostic,
+        check_health=check_health,
     )
     return _instance
 

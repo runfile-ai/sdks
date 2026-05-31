@@ -42,6 +42,7 @@ class FakeIngest:
     policy_version: str = "3.2.1"
     policy_rules: list[dict[str, Any]] = field(default_factory=list)
     tokenize_count: int = 0
+    schema_versions_supported: list[str] = field(default_factory=lambda: ["1.0"])
     _server: ThreadingHTTPServer | None = None
     _thread: threading.Thread | None = None
 
@@ -96,7 +97,8 @@ def _make_handler(state: FakeIngest) -> type[BaseHTTPRequestHandler]:
             self._record(None)
             if self.path == "/v1/health":
                 self._send(200, {"status": "healthy", "region": "eu-west-2",
-                                 "api_version": "1.0.0", "schema_versions_supported": ["1.0"]})
+                                 "api_version": "1.0.0",
+                                 "schema_versions_supported": state.schema_versions_supported})
             elif self.path == "/v1/policies/current":
                 self._send(200, {
                     "policy_version": state.policy_version,
