@@ -3,12 +3,8 @@
 The wire-level identity the SDK reports on every event and on the
 ``Runfile-SDK-Name`` ingest header. This MUST be a value the schema's
 ``SdkNameEnum`` (and the Ingest API header enum) accepts, or the Ingest API
-rejects the batch at validation.
-
-Follow-up (see CONTRIBUTING.md): the deployed schema's ``SdkNameEnum`` is
-currently ``['runfile-py', '@runfile-ai/sdk']``-era; it must be updated to
-include ``runfile-ai`` and the Ingest/Event-Processor validators redeployed
-before the first release of this package.
+rejects the batch at validation. ``runfile-ai`` is in the deployed schema
+(``@runfile-ai/schemas`` >= 0.6.0) and accepted by the live Ingest validator.
 """
 
 from __future__ import annotations

@@ -15,18 +15,13 @@ filled in package by package.
 | Wire `sdk.name` (Python) | `runfile-ai` |
 | Wire `sdk.name` (TS) | `@runfile-ai/sdk` |
 
-## Open cross-repo follow-up — wire `sdk.name` (BLOCKS first release)
+## Wire `sdk.name` — DONE
 
-The SDKs report `sdk.name = "runfile-ai"` / `"@runfile-ai/sdk"`. The deployed
-schema's `SdkNameEnum` (`schemas/src/event.ts`) and the Ingest API
-`Runfile-SDK-Name` header enum still use the old identifiers. Before any SDK
-release that talks to prod:
-
-1. Update `SdkNameEnum` in `schemas/` to include `runfile-ai` and `@runfile-ai/sdk`.
-2. Regenerate Python / Go / JSON-Schema artifacts; add a changeset (minor — additive).
-3. Bump and redeploy the Ingest API + Event Processor validators in `platform/`.
-
-Until then, real batches from these SDKs are rejected at ingest validation.
+The SDKs report `sdk.name = "runfile-ai"` / `"@runfile-ai/sdk"`. These are in the
+deployed schema's `SdkNameEnum` (`@runfile-ai/schemas` >= 0.6.0, generated to
+Python/Go/JSON) and accepted by the live Ingest validator — real batches are
+accepted. (If these wire identifiers ever change, update `SdkNameEnum`,
+regenerate, and redeploy the Ingest / Event-Processor validators first.)
 
 ## Per-package state
 
