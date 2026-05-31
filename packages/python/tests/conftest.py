@@ -32,6 +32,7 @@ def sdk() -> Iterator[runfile_ai.RunfileClient]:
         environment="production",
         base_url="http://localhost:9",
         start_flusher=False,  # deterministic: hot-path tests inspect the buffer
+        fetch_policy=False,  # no network in hot-path tests
     )
     yield inst
 

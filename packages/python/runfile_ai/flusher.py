@@ -114,6 +114,7 @@ class Flusher:
     def _loop(self) -> None:
         while not self._stop.wait(self.interval_seconds):
             try:
+                self.client.refresh_policy_if_stale()
                 self.flush_now()
             except Exception:  # never let the flusher thread die
                 pass

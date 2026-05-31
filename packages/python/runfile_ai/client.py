@@ -4,8 +4,6 @@
 constructs the HTTP client (bearer-auth, no AWS credentials), loads the
 redaction policy, and starts the background flusher. The flusher — not the hot
 path — does classification, redaction, encryption, batching, and shipping.
-
-Skeleton: signatures and wiring are in place; the bodies are TODO.
 """
 
 from __future__ import annotations
@@ -18,11 +16,9 @@ import httpx
 from ._constants import DEFAULT_BASE_URL, DEFAULT_REGION
 from .buffer import EventBuffer
 from .datakey import DataKeyCache
+from .policy import PolicyCache
 
 _API_KEY_RE = re.compile(r"^rf_(live|test)_[a-z0-9]{32}$")
-
-# Default redaction policy version until GET /v1/policies/current is wired.
-_DEFAULT_POLICY_VERSION = "0.0.0"
 
 _instance: Optional["RunfileClient"] = None
 
@@ -39,6 +35,7 @@ class RunfileClient:
         base_url: str = DEFAULT_BASE_URL,
         disabled: bool = False,
         start_flusher: bool = True,
+        fetch_policy: bool = True,
     ) -> None:
         if not disabled and not _API_KEY_RE.match(api_key):
             raise ValueError("invalid API key shape; expected rf_<live|test>_<32 base32 chars>")
@@ -48,10 +45,6 @@ class RunfileClient:
         self.base_url = base_url.rstrip("/")
         self.disabled = disabled
 
-        # Redaction policy version stamped on runs/events. Populated by the
-        # policy fetch (later slice); a safe default until then.
-        self.redaction_policy_version = _DEFAULT_POLICY_VERSION
-
         # Shared sync HTTP client (the flusher's transport). The SDK holds no AWS
         # credentials — only the bearer API key.
         self._http = httpx.Client(timeout=10.0)
@@ -59,6 +52,11 @@ class RunfileClient:
         self.datakeys = DataKeyCache(
             client=self._http, base_url=self.base_url, api_key=self.api_key
         )
+        self._policy_cache = PolicyCache(
+            client=self._http, base_url=self.base_url, api_key=self.api_key
+        )
+        if fetch_policy and not disabled:
+            self._policy_cache.refresh_if_stale()  # best-effort; never blocks capture
 
         # Background flusher (chain → encrypt → ship). Importing here avoids a
         # module-level import cycle (flusher type-checks against this class).
@@ -67,8 +65,16 @@ class RunfileClient:
         self._flusher = Flusher(client=self)
         if start_flusher and not disabled:
             self._flusher.start()
-        # TODO (next slice): Spool (ciphertext-only disk durability), PolicyCache
-        # (GET /v1/policies/current), and an atexit best-effort final drain.
+        # TODO (next slice): Spool (ciphertext-only disk durability) + atexit drain.
+
+    @property
+    def redaction_policy_version(self) -> str:
+        """Policy version stamped on runs/events (default until a policy is fetched)."""
+        return self._policy_cache.version()
+
+    def refresh_policy_if_stale(self) -> None:
+        """Best-effort policy refresh, called periodically by the flusher thread."""
+        self._policy_cache.refresh_if_stale()
 
     def flush(self) -> None:
         """Force a synchronous buffer drain. Blocks until the in-flight batches ship."""
@@ -89,6 +95,7 @@ def init(
     base_url: str = DEFAULT_BASE_URL,
     disabled: bool = False,
     start_flusher: bool = True,
+    fetch_policy: bool = True,
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance)."""
     global _instance
@@ -101,6 +108,7 @@ def init(
         base_url=base_url,
         disabled=disabled,
         start_flusher=start_flusher,
+        fetch_policy=fetch_policy,
     )
     return _instance
 
