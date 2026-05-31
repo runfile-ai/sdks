@@ -81,3 +81,15 @@ class EventBuffer:
             items = self._items
             self._items = []
             return items
+
+    def drop_run(self, run_id: str) -> int:
+        """Remove all buffered items for one run (overflow whole-run drop).
+
+        Returns the number of items removed. Used to drop a run *atomically* —
+        dropping individual events would tear that run's hash chain.
+        """
+        with self._lock:
+            kept = [i for i in self._items if i.run_id != run_id]
+            removed = len(self._items) - len(kept)
+            self._items = kept
+            return removed

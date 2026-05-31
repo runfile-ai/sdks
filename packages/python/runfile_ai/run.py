@@ -54,6 +54,7 @@ class Run:
     segment_index: int = 0
     local_seq: int = 0
     last_event_hash_local: Optional[str] = None  # set by the flusher as it chains
+    dropped: bool = False  # set when the run is abandoned due to buffer overflow
     _run_token: Any = field(default=None, repr=False, compare=False)
     _parent_token: Any = field(default=None, repr=False, compare=False)
 
@@ -85,19 +86,14 @@ def _default_actor(run: Run) -> dict[str, str]:
     return {"type": "agent", "agent_identity": run.agent_identity}
 
 
-def _emit_event(
+def _build_event(
     run: Run,
     *,
     kind: str,
     name: str,
-    payload: Any = None,
     actor: Optional[dict[str, Any]] = None,
     **extra: Any,
-) -> str:
-    """Construct one event's metadata, stash its cleartext payload, buffer it.
-
-    Returns the new event_id. Sets it as the ambient parent for the next event.
-    """
+) -> tuple[str, dict[str, Any]]:
     inst = _require_instance()
     event_id = generate_event_id()
     event: dict[str, Any] = {
@@ -121,10 +117,61 @@ def _emit_event(
     for key, value in extra.items():
         if value is not None:
             event[key] = value
+    return event_id, event
 
-    inst.buffer.append(BufferedEvent(event=event, raw_payload=payload, run=run))
+
+def _emit_event(
+    run: Run,
+    *,
+    kind: str,
+    name: str,
+    payload: Any = None,
+    actor: Optional[dict[str, Any]] = None,
+    **extra: Any,
+) -> str:
+    """Construct one event's metadata, stash its cleartext payload, buffer it.
+
+    Returns the new event_id (empty if the run was overflow-dropped). Sets it as
+    the ambient parent for the next event.
+    """
+    if run.dropped:
+        return ""
+    event_id, event = _build_event(run, kind=kind, name=name, actor=actor, **extra)
+    _buffer_append(run, BufferedEvent(event=event, raw_payload=payload, run=run))
     set_parent_event(event_id)
     return event_id
+
+
+def _buffer_append(run: Run, item: Any) -> None:
+    """Append to the buffer and apply the overflow policy.
+
+    Backpressure (default ``capture_blocking``): on reaching the soft cap, do a
+    synchronous flush to drain — the agent's hot path briefly pays the ship cost,
+    but no data is lost. With blocking disabled, drop the WHOLE current run
+    atomically (never mid-run events) and emit a loud ``sdk_diagnostic``.
+    """
+    inst = _require_instance()
+    if run.dropped:
+        return
+    inst.buffer.append(item)
+    if len(inst.buffer) >= inst.buffer.soft_cap:
+        if inst.capture_blocking:
+            inst.flush()
+        else:
+            _drop_run_overflow(inst, run)
+
+
+def _drop_run_overflow(inst: Any, run: Run) -> None:
+    removed = inst.buffer.drop_run(run.run_id)
+    run.dropped = True
+    _, diagnostic = _build_event(
+        run,
+        kind="sdk_diagnostic",
+        name="run_dropped_overflow",
+        labels={"dropped_event_count": str(removed)},
+    )
+    # Append directly (bypass the dropped-run guard) so the failure is visible.
+    inst.buffer.append(BufferedEvent(event=diagnostic, raw_payload=None, run=run))
 
 
 # --------------------------------------------------------------------------- #
@@ -165,7 +212,7 @@ def start_run(
     if continued_from is not None:
         run_body["continued_from"] = continued_from
 
-    inst.buffer.append(BufferedRunItem(item={"type": "run_create", "run": run_body}, run=run))
+    _buffer_append(run, BufferedRunItem(item={"type": "run_create", "run": run_body}, run=run))
     return run
 
 
@@ -174,7 +221,6 @@ def end_run(*, outcome: str = "success", final_event_id: Optional[str] = None) -
     run = current_run()
     if run is None:
         return
-    inst = _require_instance()
     item: dict[str, Any] = {
         "type": "run_end",
         "run_id": run.run_id,
@@ -183,7 +229,7 @@ def end_run(*, outcome: str = "success", final_event_id: Optional[str] = None) -
     }
     if final_event_id is not None:
         item["final_event_id"] = final_event_id
-    inst.buffer.append(BufferedRunItem(item=item, run=run))
+    _buffer_append(run, BufferedRunItem(item=item, run=run))
     run.lifecycle_state = "ended"
     _clear_run_context(run)
 
@@ -200,7 +246,6 @@ def suspend_run(
     Returns the run_suspend event_id (the ``triggered_by_event_id`` link).
     """
     run = _require_run()
-    inst = _require_instance()
     details: dict[str, Any] = {"reason": reason, "detection_source": "customer_explicit"}
     if expected_resumer is not None:
         details["expected_resumer"] = expected_resumer
@@ -209,7 +254,8 @@ def suspend_run(
 
     event_id = _emit_event(run, kind="run_suspend", name=name or reason, suspension_details=details)
     state = _AWAITING_STATE.get(reason, "awaiting_human")
-    inst.buffer.append(
+    _buffer_append(
+        run,
         BufferedRunItem(
             item={
                 "type": "run_update",
@@ -218,7 +264,7 @@ def suspend_run(
                 "triggered_by_event_id": event_id,
             },
             run=run,
-        )
+        ),
     )
     run.lifecycle_state = state
     return event_id
@@ -234,14 +280,14 @@ def resume_run(
     run = _require_run()
     if run_id is not None and run_id != run.run_id:
         raise ValueError(f"resume_run: active run is {run.run_id}, not {run_id}")
-    inst = _require_instance()
     run.begin_segment()
     details: dict[str, Any] = {"triggered_by": triggered_by}
     if resumer_principal is not None:
         details["resumer_principal"] = resumer_principal
 
     event_id = _emit_event(run, kind="run_resume", name="resume", resume_details=details)
-    inst.buffer.append(
+    _buffer_append(
+        run,
         BufferedRunItem(
             item={
                 "type": "run_update",
@@ -250,7 +296,7 @@ def resume_run(
                 "triggered_by_event_id": event_id,
             },
             run=run,
-        )
+        ),
     )
     run.lifecycle_state = "active"
     return event_id
@@ -261,9 +307,9 @@ def abandon_run(*, reason: Optional[str] = None, run_id: Optional[str] = None) -
     run = _require_run()
     if run_id is not None and run_id != run.run_id:
         raise ValueError(f"abandon_run: active run is {run.run_id}, not {run_id}")
-    inst = _require_instance()
     event_id = _emit_event(run, kind="run_abandon", name=reason or "abandon")
-    inst.buffer.append(
+    _buffer_append(
+        run,
         BufferedRunItem(
             item={
                 "type": "run_update",
@@ -272,7 +318,7 @@ def abandon_run(*, reason: Optional[str] = None, run_id: Optional[str] = None) -
                 "triggered_by_event_id": event_id,
             },
             run=run,
-        )
+        ),
     )
     run.lifecycle_state = "ended"
     _clear_run_context(run)

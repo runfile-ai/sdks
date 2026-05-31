@@ -41,6 +41,8 @@ class RunfileClient:
         start_flusher: bool = True,
         fetch_policy: bool = True,
         spool_dir: str | os.PathLike[str] | None = None,
+        buffer_soft_cap: int = 10_000,
+        capture_blocking: bool = True,
     ) -> None:
         if not disabled and not _API_KEY_RE.match(api_key):
             raise ValueError("invalid API key shape; expected rf_<live|test>_<32 base32 chars>")
@@ -49,11 +51,14 @@ class RunfileClient:
         self.region = region
         self.base_url = base_url.rstrip("/")
         self.disabled = disabled
+        # Overflow policy: backpressure (synchronous flush) when True; drop whole
+        # runs atomically (never mid-run events) when False.
+        self.capture_blocking = capture_blocking
 
         # Shared sync HTTP client (the flusher's transport). The SDK holds no AWS
         # credentials — only the bearer API key.
         self._http = httpx.Client(timeout=10.0)
-        self.buffer = EventBuffer()
+        self.buffer = EventBuffer(soft_cap=buffer_soft_cap)
         self.datakeys = DataKeyCache(
             client=self._http, base_url=self.base_url, api_key=self.api_key
         )
@@ -116,6 +121,8 @@ def init(
     start_flusher: bool = True,
     fetch_policy: bool = True,
     spool_dir: str | os.PathLike[str] | None = None,
+    buffer_soft_cap: int = 10_000,
+    capture_blocking: bool = True,
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance)."""
     global _instance
@@ -130,6 +137,8 @@ def init(
         start_flusher=start_flusher,
         fetch_policy=fetch_policy,
         spool_dir=spool_dir,
+        buffer_soft_cap=buffer_soft_cap,
+        capture_blocking=capture_blocking,
     )
     return _instance
 
