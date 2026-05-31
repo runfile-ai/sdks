@@ -43,8 +43,7 @@ def test_end_to_end_tokenize_replaces_pii_with_token(fake_ingest: FakeIngest) ->
     fake_ingest.policy_rules = [{"classification": "email_address", "treatment": "tokenize"}]
     inst = runfile_ai.init(
         api_key=VALID_TEST_KEY,
-        base_url=fake_ingest.base_url,
-        vault_base_url=fake_ingest.base_url,  # fake serves /v1/tokenize too
+        base_url=fake_ingest.base_url,  # one host serves /v1/tokenize too
         start_flusher=False,
     )
     with runfile_ai.run(agent_identity=AGENT):

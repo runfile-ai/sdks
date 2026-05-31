@@ -2,9 +2,9 @@
 
 The redactor's ``tokenize`` / ``tokenize_with_fallback`` treatments replace a PII
 span with an opaque ``tok_*`` reference whose cleartext mapping lives in the
-Vault (under a separate KMS key, resolvable only with justification). The Vault
-is a SEPARATE service from the Ingest API (``vault.<region>``), authenticated
-with the same ``rf_*`` bearer key.
+Vault (under a separate KMS key, resolvable only with justification). Tokenize is
+served by ``POST /v1/tokenize`` on the same regional host as the rest of the SDK
+endpoints (``api.<region>.runfile.ai``), authenticated with the ``rf_*`` key.
 
 Tokenization is best-effort: on any failure ``tokenize`` returns ``None`` and the
 redactor drops the value (never leaks cleartext) and flags it.
@@ -18,8 +18,6 @@ Note the contract mismatch handled here: the redactor's classification names
 from __future__ import annotations
 
 import httpx
-
-from ._constants import DEFAULT_REGION
 
 #: Map the redactor's detected class -> the Vault ClassificationEnum.
 _VAULT_CLASSIFICATION = {
@@ -45,12 +43,8 @@ _DEFAULT_VAULT_CLASSIFICATION = "other_identifier"
 _MAX_VALUE_LEN = 4096  # Vault TokenizeRequest.value max
 
 
-def default_vault_base_url(region: str = DEFAULT_REGION) -> str:
-    return f"https://vault.{region}.runfile.ai"
-
-
 class VaultClient:
-    """Thin client for the Vault's SDK-facing tokenize endpoint."""
+    """Tokenize client — POST /v1/tokenize on the regional host."""
 
     def __init__(self, *, client: httpx.Client, base_url: str, api_key: str) -> None:
         self._client = client
