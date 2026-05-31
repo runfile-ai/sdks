@@ -18,9 +18,11 @@ import httpx
 
 from ._constants import DEFAULT_BASE_URL, DEFAULT_REGION
 from .buffer import EventBuffer
+from .classifier import Redactor
 from .datakey import DataKeyCache
 from .policy import PolicyCache, RedactionPolicy
 from .spool import DEFAULT_SPOOL_DIR, Spool
+from .vault import VaultClient, default_vault_base_url
 
 _API_KEY_RE = re.compile(r"^rf_(live|test)_[a-z0-9]{32}$")
 
@@ -43,6 +45,7 @@ class RunfileClient:
         spool_dir: str | os.PathLike[str] | None = None,
         buffer_soft_cap: int = 10_000,
         capture_blocking: bool = True,
+        vault_base_url: str | None = None,
     ) -> None:
         if not disabled and not _API_KEY_RE.match(api_key):
             raise ValueError("invalid API key shape; expected rf_<live|test>_<32 base32 chars>")
@@ -70,6 +73,18 @@ class RunfileClient:
 
         resolved_spool = spool_dir or os.environ.get("RUNFILE_SPOOL_DIR") or DEFAULT_SPOOL_DIR
         self.spool = Spool(directory=Path(resolved_spool))
+
+        # Vault tokenization (a separate service). Drives the redactor's
+        # tokenize / tokenize_with_fallback treatments.
+        resolved_vault = (
+            vault_base_url
+            or os.environ.get("RUNFILE_VAULT_URL")
+            or default_vault_base_url(self.region)
+        )
+        self._vault = VaultClient(
+            client=self._http, base_url=resolved_vault, api_key=self.api_key
+        )
+        self.redactor = Redactor(tokenizer=self._vault.tokenize)
 
         # Background flusher (chain → encrypt → ship). Importing here avoids a
         # module-level import cycle (flusher type-checks against this class).
@@ -127,6 +142,7 @@ def init(
     spool_dir: str | os.PathLike[str] | None = None,
     buffer_soft_cap: int = 10_000,
     capture_blocking: bool = True,
+    vault_base_url: str | None = None,
 ) -> RunfileClient:
     """Initialise the SDK once at process start. Idempotent (returns the existing instance)."""
     global _instance
@@ -143,6 +159,7 @@ def init(
         spool_dir=spool_dir,
         buffer_soft_cap=buffer_soft_cap,
         capture_blocking=capture_blocking,
+        vault_base_url=vault_base_url,
     )
     return _instance
 

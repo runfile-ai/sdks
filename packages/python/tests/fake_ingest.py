@@ -9,6 +9,7 @@ exercised end-to-end over real HTTP without touching prod.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import threading
@@ -40,6 +41,7 @@ class FakeIngest:
     batch_return_207: bool = False
     policy_version: str = "3.2.1"
     policy_rules: list[dict[str, Any]] = field(default_factory=list)
+    tokenize_count: int = 0
     _server: ThreadingHTTPServer | None = None
     _thread: threading.Thread | None = None
 
@@ -121,6 +123,12 @@ def _make_handler(state: FakeIngest) -> type[BaseHTTPRequestHandler]:
                     "wrapped": base64.b64encode(b"wrapped-key-blob").decode(),
                     "algorithm": "aes-256-gcm",
                 })
+            elif self.path == "/v1/tokenize":
+                # Deterministic token from the value (mimics the Vault's HMAC).
+                value = (body or {}).get("value", "")
+                digest = hashlib.sha256(value.encode()).hexdigest()[:24]
+                state.tokenize_count += 1
+                self._send(200, {"token": f"tok_{digest}", "created": True})
             elif self.path == "/v1/batches":
                 if state.batch_fail_statuses:
                     status = state.batch_fail_statuses.pop(0)

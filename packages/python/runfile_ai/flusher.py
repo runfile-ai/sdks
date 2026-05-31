@@ -40,7 +40,7 @@ from ._constants import SCHEMA_VERSION, SDK_NAME, sdk_version
 from ._hashing import ZERO_SENTINEL, compute_event_hash
 from ._ids import generate_batch_id
 from .buffer import BufferedEvent, BufferedItem, BufferedRunItem
-from .classifier import CLASSIFIER_VERSION, Redactor
+from .classifier import CLASSIFIER_VERSION
 
 if TYPE_CHECKING:
     from .client import RunfileClient
@@ -79,7 +79,6 @@ class Flusher:
     client: "RunfileClient"
     interval_seconds: float = 2.0
     retry: RetryConfig = field(default_factory=RetryConfig)
-    redactor: Redactor = field(default_factory=Redactor)
 
     _last_event_hash: dict[str, str] = field(default_factory=dict)
     _drain_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -184,7 +183,7 @@ class Flusher:
 
     def _build_payload_ref(self, item: BufferedEvent) -> dict[str, Any]:
         # Redact (the client-side PII boundary) before encryption.
-        redaction = self.redactor.apply(item.raw_payload, self.client.current_policy())
+        redaction = self.client.redactor.apply(item.raw_payload, self.client.current_policy())
         plaintext, content_type = _serialize(redaction.value)
 
         from .encrypt import aes_gcm_encrypt  # local import: avoid import cycle
