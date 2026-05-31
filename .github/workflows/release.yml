@@ -101,6 +101,31 @@ jobs:
           skip-existing: true
           # Trusted publishing — no `password:` on purpose.
 
+      # Mark the source commit that produced this PyPI release. PyPI never tags
+      # the repo, so do it here. Idempotent: skips when the tag already exists, so
+      # this only fires on the push that bumped pyproject to a new version (which
+      # is the same push that uploaded a new version above). Backfills the tag for
+      # an already-published version on first run. The python-v* tag does not match
+      # any `on.push.tags` pattern, and GITHUB_TOKEN-pushed tags don't re-trigger
+      # workflows, so there is no release loop.
+      - name: Tag + GitHub Release for the PyPI version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver="$(grep -m1 '^version = ' packages/python/pyproject.toml | cut -d'"' -f2)"
+          tag="python-v$ver"
+          if git ls-remote --tags --exit-code origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag already exists — release already tagged, skipping."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$tag" -m "runfile-ai $ver"
+          git push origin "$tag"
+          gh release create "$tag" \
+            --title "runfile-ai $ver" \
+            --notes "\`runfile-ai $ver\` published to PyPI — https://pypi.org/project/runfile-ai/$ver/"
+
   verifier-cli:
     if: startsWith(github.ref, 'refs/tags/verifier-cli/v')
     runs-on: ubuntu-latest
