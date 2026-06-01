@@ -414,57 +414,76 @@ class _ShipError(RuntimeError):
 def _assign_parallel_groups(items: list[BufferedItem]) -> None:
     """Tag concurrently-dispatched tool calls with a shared ``parallel_group_id``.
 
-    Concurrency is read structurally, not guessed: within a run, a maximal run of
-    **≥2 consecutive ``tool_call`` events that share an issuing ``llm_call`` with no
-    ``tool_result`` between them** was dispatched in parallel — a *sequential* call
-    only ever happens after its predecessor's result, so two calls back-to-back
-    must be concurrent. The adapter can't assign this at capture time (the first
-    call is already buffered before the second arrives); the flusher can, because
-    it sees the drained events together. Each grouped call's matching
-    ``tool_result`` (linked via ``parent_event_id``) inherits the same group.
+    Concurrency is read from causal structure, not adjacency: ``≥2 tool_call``
+    events that **share one issuing ``llm_call``** (same ``parent_event_id``, and
+    that parent is an ``llm_call``) came from a single assistant message — one
+    ``message_id`` = one turn = one ``llm_call`` — which is the Anthropic API's own
+    statement that those calls were dispatched together. This holds regardless of
+    how the CLI streams them: it interleaves a parallel turn as ``call A → result A
+    → call B → result B``, so an adjacency/"no result between" rule misses them —
+    but their shared issuer does not. The adapter can't assign this at capture time
+    (the first call is buffered before the second arrives); the flusher can, because
+    it sees the drained events together. Each grouped call's matching ``tool_result``
+    (linked via ``parent_event_id``) inherits the same group.
 
-    Sound by construction (never groups sequential calls, never fabricates a
-    group). Only limitation: a parallel batch split across two drains isn't
-    grouped — the earlier calls already shipped — which degrades to "ungrouped"
-    (honest), never to a wrong group. Mutates event dicts in place before hashing,
-    so the group id is part of the committed ``event_hash``. Events already carrying
-    a ``parallel_group_id`` (e.g. set by the adapter) are left untouched.
+    Sound by construction: it groups only calls that share an ``llm_call`` issuer
+    (never sequential calls, which each get their own turn/issuer; never a
+    fabricated group). Only limitation: a parallel batch split across two drains
+    isn't grouped — the earlier calls already shipped — which degrades to
+    "ungrouped" (honest), never to a wrong group. Mutates event dicts in place
+    before hashing, so the group id is part of the committed ``event_hash``. Events
+    already carrying a ``parallel_group_id`` (e.g. the manual ``parallel_group``
+    context) are left untouched.
     """
-    pending: dict[str, list[dict[str, Any]]] = {}  # run_id -> open consecutive tool_calls
-    call_group: dict[str, str] = {}  # tool_call event_id -> assigned group_id
+    # Pass 1: kind by event_id, so we can require a tool_call's parent be an llm_call.
+    kind_of: dict[str, str] = {}
+    for item in items:
+        if isinstance(item, BufferedEvent):
+            ev = item.event
+            kind_of[ev.get("event_id", "")] = ev.get("action", {}).get("kind", "")
 
-    def close(run_id: str) -> None:
-        batch = pending.get(run_id)
-        if batch and len(batch) >= 2:
-            group_id = generate_parallel_group_id()
-            for ev in batch:
-                ev["parallel_group_id"] = group_id
-                call_group[ev["event_id"]] = group_id
-        pending[run_id] = []
-
+    # Pass 2: bucket tool_calls by their issuing llm_call (in first-seen order).
+    by_issuer: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
     for item in items:
         if not isinstance(item, BufferedEvent):
-            continue  # run_create/update/end don't participate
+            continue
         event = item.event
-        run_id = event.get("run_id", "")
-        kind = event.get("action", {}).get("kind")
-        if kind == "tool_call":
-            if "parallel_group_id" in event:
-                continue  # already grouped (adapter co-resident path) — leave it
-            batch = pending.setdefault(run_id, [])
-            # A different issuer means a new turn → the prior batch is closed.
-            if batch and event.get("parent_event_id") != batch[0].get("parent_event_id"):
-                close(run_id)
-            pending.setdefault(run_id, []).append(event)
-        elif kind == "tool_result":
-            close(run_id)  # results close the open call batch (and assign groups)
-            group_id = call_group.get(event.get("parent_event_id") or "")
-            if group_id is not None and "parallel_group_id" not in event:
-                event["parallel_group_id"] = group_id
-        else:
-            close(run_id)  # llm_call / lifecycle / other ends a concurrent batch
-    for run_id in list(pending):
-        close(run_id)
+        if event.get("action", {}).get("kind") != "tool_call":
+            continue
+        if "parallel_group_id" in event:
+            continue  # already grouped (manual parallel_group context) — leave it
+        parent = event.get("parent_event_id")
+        if not parent or kind_of.get(parent) != "llm_call":
+            continue  # no resolved issuer (race fallback) → can't claim concurrency
+        if parent not in by_issuer:
+            by_issuer[parent] = []
+            order.append(parent)
+        by_issuer[parent].append(event)
+
+    # Pass 3: one group per issuer that dispatched ≥2 calls; tag the calls.
+    call_group: dict[str, str] = {}  # tool_call event_id -> assigned group_id
+    for parent in order:
+        calls = by_issuer[parent]
+        if len(calls) < 2:
+            continue
+        group_id = generate_parallel_group_id()
+        for ev in calls:
+            ev["parallel_group_id"] = group_id
+            call_group[ev["event_id"]] = group_id
+
+    # Pass 4: each grouped call's tool_result (parented on the call) inherits it.
+    for item in items:
+        if not isinstance(item, BufferedEvent):
+            continue
+        event = item.event
+        if event.get("action", {}).get("kind") != "tool_result":
+            continue
+        if "parallel_group_id" in event:
+            continue
+        group_id = call_group.get(event.get("parent_event_id") or "")
+        if group_id is not None:
+            event["parallel_group_id"] = group_id
 
 
 def _serialize(payload: Any) -> tuple[bytes, str]:

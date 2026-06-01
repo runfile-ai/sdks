@@ -41,13 +41,35 @@ def test_concurrent_tool_calls_share_a_group() -> None:
     assert g[1].startswith("pg_")
 
 
-def test_sequential_tool_calls_not_grouped() -> None:
-    # call/result/call/result (same issuer) → sequential, never grouped.
+def test_interleaved_parallel_calls_grouped() -> None:
+    # The CLI streams a PARALLEL turn as call/result/call/result — the result of
+    # the first call arrives before the second call's block — but both calls share
+    # one issuing llm_call (one message_id = one assistant message with two
+    # tool_use blocks = the API's own statement of concurrency). They MUST group;
+    # interleaved results don't make them sequential. (Regression for the old
+    # adjacency rule that wrongly split this.)
     items = [
         _ev("L", "llm_call", None),
         _ev("A", "tool_call", "L"),
         _ev("RA", "tool_result", "A"),
         _ev("B", "tool_call", "L"),
+        _ev("RB", "tool_result", "B"),
+    ]
+    _assign_parallel_groups(items)
+    g = _g(items)
+    assert g[0] is None  # llm_call not in the group
+    assert g[1] == g[2] == g[3] == g[4] is not None  # both calls + both results share it
+
+
+def test_genuinely_sequential_calls_not_grouped() -> None:
+    # Truly sequential = the model issues B in a NEW turn after seeing A's result,
+    # so B is issued by a DIFFERENT llm_call (L2). Different issuers → never grouped.
+    items = [
+        _ev("L1", "llm_call", None),
+        _ev("A", "tool_call", "L1"),
+        _ev("RA", "tool_result", "A"),
+        _ev("L2", "llm_call", None),
+        _ev("B", "tool_call", "L2"),
         _ev("RB", "tool_result", "B"),
     ]
     _assign_parallel_groups(items)

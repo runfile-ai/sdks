@@ -477,18 +477,20 @@ async def test_parallel_tool_calls_share_a_group_via_flusher(sdk, fake_claude) -
     assert len(groups) == 1 and None not in groups and next(iter(groups)).startswith("pg_")
 
 
-async def test_sequential_tools_in_one_turn_not_grouped(sdk, fake_claude) -> None:
-    """A turn that issues a tool, gets its result, then issues another (call /
-    result / call) is sequential — must NOT be grouped, even though both share the
-    turn's llm_call."""
+async def test_sequential_tools_across_turns_not_grouped(sdk, fake_claude) -> None:
+    """Genuinely sequential tools — the model issues the second only after seeing
+    the first's result — arrive in SEPARATE turns (distinct message_id → distinct
+    llm_call). Different issuers → must NOT be grouped."""
     from runfile_ai.flusher import _assign_parallel_groups
 
     async def fake_query(*, prompt, options=None, **kw):
         pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
         post = (options.hooks or {})["PostToolUse"][0].hooks[0]
+        # turn m1 issues tool a; its result comes back; THEN a new turn m2 issues b.
         yield AssistantMessage(content=[ToolUseBlock(id="t1", name="a")], model="claude-opus-4-8", session_id="s1", message_id="m1")
         await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="a", tool_input={}, tool_use_id="t1"), "t1", None)
         await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="a", tool_response={}, tool_use_id="t1"), "t1", None)
+        yield AssistantMessage(content=[ToolUseBlock(id="t2", name="b")], model="claude-opus-4-8", session_id="s1", message_id="m2")
         await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="b", tool_input={}, tool_use_id="t2"), "t2", None)
         await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="b", tool_response={}, tool_use_id="t2"), "t2", None)
         yield ResultMessage(session_id="s1")
@@ -499,6 +501,37 @@ async def test_sequential_tools_in_one_turn_not_grouped(sdk, fake_claude) -> Non
     _assign_parallel_groups(items)
     tool_events = [e for e in _events(sdk.buffer) if e["action"]["kind"] in ("tool_call", "tool_result")]
     assert all("parallel_group_id" not in e for e in tool_events)
+
+
+async def test_interleaved_parallel_tools_in_one_turn_grouped(sdk, fake_claude) -> None:
+    """The real CLI streaming shape for a PARALLEL turn: one message (m1) emits two
+    tool_use blocks and the CLI interleaves them as call a / result a / call b /
+    result b. Both share m1's single llm_call issuer, so they MUST be grouped — the
+    interleaved result must not split them. (Regression for the live-captured
+    fan-out that the old adjacency rule left ungrouped.)"""
+    from runfile_ai.flusher import _assign_parallel_groups
+
+    async def fake_query(*, prompt, options=None, **kw):
+        pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
+        post = (options.hooks or {})["PostToolUse"][0].hooks[0]
+        # one turn m1 carries BOTH tool_use blocks (streamed as separate messages,
+        # same message_id); the CLI runs them with results interleaved.
+        yield AssistantMessage(content=[ToolUseBlock(id="t1", name="a")], model="claude-opus-4-8", session_id="s1", message_id="m1")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="a", tool_input={}, tool_use_id="t1"), "t1", None)
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="a", tool_response={}, tool_use_id="t1"), "t1", None)
+        yield AssistantMessage(content=[ToolUseBlock(id="t2", name="b")], model="claude-opus-4-8", session_id="s1", message_id="m1")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="b", tool_input={}, tool_use_id="t2"), "t2", None)
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="b", tool_response={}, tool_use_id="t2"), "t2", None)
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+    items = sdk.buffer.snapshot()
+    _assign_parallel_groups(items)
+    tool_events = [e for e in _events(sdk.buffer) if e["action"]["kind"] in ("tool_call", "tool_result")]
+    groups = {e.get("parallel_group_id") for e in tool_events}
+    assert len(tool_events) == 4
+    assert len(groups) == 1 and None not in groups  # all 4 share one group
 
 
 async def test_streamed_turn_coalesces_to_one_llm_call(sdk, fake_claude) -> None:

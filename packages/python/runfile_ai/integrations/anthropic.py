@@ -192,8 +192,9 @@ class _CausalLinks:
     is the Anthropic Messages API correlation id, identical on a tool's call and
     its result. We record those ids here and map them onto ``parent_event_id`` so
     the chain stops asserting the false "previous event is my parent" edge.
-    (Concurrency grouping is decided downstream by the flusher from the structural
-    call/result ordering — never guessed here from "same turn".)
+    (Concurrency grouping is decided downstream by the flusher: tool calls that
+    share one issuing ``llm_call`` came from a single assistant message and are
+    grouped — never guessed here from arrival adjacency.)
     """
 
     #: tool_use_id → the ``tool_call`` event_id (so its ``tool_result`` parents on it)
@@ -204,6 +205,11 @@ class _CausalLinks:
     #: ``llm_call`` event_id (the parent a fallback tool call resolves to).
     pending: Optional[_Turn] = None
     current_llm_event_id: Optional[str] = None
+    #: message_id of the last EMITTED turn. The CLI may stream more tool_use blocks
+    #: of the SAME turn AFTER its first tool already forced emission (a parallel
+    #: fan-out arrives as call a / result a / call b …); those late blocks must
+    #: attach to the already-emitted llm_call as their issuer, NOT open a 2nd turn.
+    emitted_message_id: Optional[str] = None
 
 
 class _Registry:
@@ -647,6 +653,23 @@ def _accumulate_turn(run: Run, message: Any) -> None:
     message_id = getattr(message, "message_id", None)
     content = getattr(message, "content", None)
 
+    # Late block of a turn we ALREADY emitted: the CLI streamed another tool_use of
+    # the same message_id after its first tool forced emission (the parallel fan-out
+    # call a / result a / call b …). Don't open a second turn — bind these tool_use
+    # ids to the already-emitted llm_call so co-issued calls share one issuer (and
+    # the flusher groups them). This is what keeps an interleaved fan-out as ONE
+    # llm_call instead of one per tool.
+    if (
+        links.pending is None
+        and message_id is not None
+        and message_id == links.emitted_message_id
+    ):
+        if links.current_llm_event_id and isinstance(content, list):
+            for block in content:
+                if type(block).__name__ == "ToolUseBlock" and getattr(block, "id", None):
+                    links.issuer_event[block.id] = links.current_llm_event_id
+        return
+
     # New turn (different message_id, or none open) → close the previous one first.
     if links.pending is None or (message_id is not None and message_id != links.pending.message_id):
         _emit_pending_turn(run, links)
@@ -686,6 +709,7 @@ def _emit_pending_turn(run: Run, links: _CausalLinks) -> None:
     if turn is None:
         return
     links.pending = None
+    links.emitted_message_id = turn.message_id
     extra: dict[str, Any] = {}
     if turn.otel is not None:
         extra["otel_attributes"] = turn.otel
