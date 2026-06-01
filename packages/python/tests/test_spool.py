@@ -58,7 +58,7 @@ def test_spool_only_holds_ciphertext(fake_ingest: FakeIngest) -> None:
     raw = inst.spool.entries()[0].path.read_bytes()
     assert secret.encode() not in raw  # plaintext never hits disk
     body = inst.spool.entries()[0].body
-    pr = next(it["event"]["payload_ref"] for it in body["items"] if it["type"] == "event")
+    pr = next(it["event"]["payload_ref"] for it in body["items"] if it["type"] == "event" and "payload_ref" in it["event"])
     assert "ciphertext_base64" in pr  # only ciphertext is persisted
 
 

@@ -118,7 +118,7 @@ class RunfileClient:
 
     def _atexit_drain(self) -> None:
         try:
-            self._flusher.flush_now()
+            self._flusher.flush_now(force_all=True)  # process exit: flush the open turn too
         except Exception:
             pass
 
@@ -184,9 +184,13 @@ class RunfileClient:
         """Nudge the background flusher to drain promptly (buffer size trigger)."""
         self._flusher.notify()
 
-    def flush(self) -> None:
-        """Force a synchronous buffer drain. Blocks until the in-flight batches ship."""
-        self._flusher.flush_now()
+    def flush(self, *, force_all: bool = False) -> None:
+        """Force a synchronous buffer drain. Blocks until the in-flight batches ship.
+
+        Respects turn-atomic flushing (holds an open turn) unless ``force_all`` —
+        used by overflow back-pressure, which puts durability over grouping.
+        """
+        self._flusher.flush_now(force_all=force_all)
 
     def shutdown(self) -> None:
         """Graceful shutdown: stop + final-drain the flusher, then release resources."""

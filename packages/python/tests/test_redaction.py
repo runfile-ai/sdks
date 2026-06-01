@@ -148,7 +148,8 @@ def test_end_to_end_redaction_before_encryption(fake_ingest: FakeIngest) -> None
     runfile_ai.flush()
 
     body = next(r.body for r in fake_ingest.requests if r.path == "/v1/batches")
-    event = next(it["event"] for it in body["items"] if it["type"] == "event")
+    # pick the payload-bearing event (item 0 is now the run_create genesis event)
+    event = next(it["event"] for it in body["items"] if it["type"] == "event" and "payload_ref" in it["event"])
     payload_ref = event["payload_ref"]
     assert payload_ref["redaction_applied"]["redacted_classes"] == ["email_address"]
 

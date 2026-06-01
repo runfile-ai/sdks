@@ -57,7 +57,8 @@ def test_end_to_end_tokenize_replaces_pii_with_token(fake_ingest: FakeIngest) ->
 
     assert fake_ingest.tokenize_count >= 1
     body = next(r.body for r in fake_ingest.requests if r.path == "/v1/batches")
-    event = next(it["event"] for it in body["items"] if it["type"] == "event")
+    # pick the payload-bearing event (item 0 is now the run_create genesis event)
+    event = next(it["event"] for it in body["items"] if it["type"] == "event" and "payload_ref" in it["event"])
     payload_ref = event["payload_ref"]
     assert payload_ref["redaction_applied"]["tokenized_classes"] == ["email_address"]
 

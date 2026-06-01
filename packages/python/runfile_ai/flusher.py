@@ -10,9 +10,11 @@ This is where the off-hot-path work happens (sdk-design.md):
 The hash chain commits to ``payload_ref`` (per the canonical projection), so it
 can only be computed here, after encryption — not on the hot path. The SDK's
 ``prev_event_hash_intent`` is its local belief; the server recomputes the
-canonical value and flags a benign ``chain_break`` where they diverge (notably
-the first event of a run, whose true predecessor is the server-synthesised
-``run_create`` event).
+canonical value and *verifies* it. The SDK — the real witness — authors every
+link, including the run boundaries: a run's ``run_create`` event is its genesis
+(``prev_event_hash`` = the zero sentinel for a new conversation, or the prior
+run's ``run_end`` hash for a continuation), so there is no expected mismatch and
+any ``chain_break`` is genuine.
 
 Chain state (``last_event_hash`` per run) persists across drains because a run
 spans many flushes.
@@ -39,7 +41,7 @@ from runfile_schemas.ingest import (
 
 from ._constants import SCHEMA_VERSION, SDK_NAME, sdk_version
 from ._hashing import ZERO_SENTINEL, compute_event_hash
-from ._ids import generate_batch_id
+from ._ids import generate_batch_id, generate_parallel_group_id
 from .buffer import BufferedEvent, BufferedItem, BufferedRunItem
 from .classifier import CLASSIFIER_VERSION
 from .datakey import DataKeyError
@@ -98,6 +100,13 @@ class Flusher:
     retry: RetryConfig = field(default_factory=RetryConfig)
     max_items_per_batch: int = _MAX_ITEMS_PER_BATCH
     max_batch_bytes: int = _MAX_BATCH_BYTES
+    # Turn-atomic flushing safety valve: if an open turn stays held longer than
+    # max(interval_seconds, turn_hold_max_seconds) — a stalled stream, or an adapter
+    # that never signalled close — release it anyway (durability/visibility over
+    # grouping; that one turn reverts to ungrouped-but-correct). monotonic is
+    # injectable for deterministic tests.
+    turn_hold_max_seconds: float = 5.0
+    monotonic: Callable[[], float] = time.monotonic
 
     _last_event_hash: dict[str, str] = field(default_factory=dict)
     _drain_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -109,6 +118,10 @@ class Flusher:
     # Sticky: a 401/403 means the key is bad — stop hammering the API; keep
     # capturing + spooling encrypted batches for after the key is fixed.
     _auth_failed: bool = False
+    # Safety-valve bookkeeping: when the held open turn first appeared, and its size
+    # last drain — a held suffix that stops growing across drains has stalled.
+    _held_since: float | None = None
+    _last_held_count: int = 0
 
     # ---- thread lifecycle ------------------------------------------------- #
 
@@ -141,7 +154,7 @@ class Flusher:
         saved = self.retry
         self.retry = RetryConfig(max_attempts=1, sleep=lambda _s: None)
         try:
-            self.flush_now()
+            self.flush_now(force_all=True)  # shutdown: ship the open turn too, durability first
         finally:
             self.retry = saved
 
@@ -160,17 +173,23 @@ class Flusher:
 
     # ---- draining --------------------------------------------------------- #
 
-    def flush_now(self) -> DrainResult:
-        """Synchronously drain and ship everything currently buffered."""
+    def flush_now(self, *, force_all: bool = False) -> DrainResult:
+        """Synchronously drain and ship buffered items.
+
+        Normally drains only *whole, closed turns* (turn-atomic flushing) so inferred
+        parallel-grouping sees complete turns; ``force_all=True`` drains everything,
+        ignoring the watermark (overflow back-pressure, shutdown, atexit).
+        """
         with self._drain_lock:
             result = DrainResult()
             # Re-send anything spooled by a prior failed drain first (FIFO).
             # Skip while auth is broken — re-posting would just 401 again.
             if not self._auth_failed:
                 self._drain_spool(result)
-            items = self.client.buffer.take_all()
+            items = self._take_for_drain(force_all)
             if not items:
                 return result
+            _assign_parallel_groups(items)
             wire_items: list[dict[str, Any]] = []
             for idx, item in enumerate(items):
                 try:
@@ -189,6 +208,34 @@ class Flusher:
             for chunk in self._chunk_batches(wire_items):
                 self._ship_batch(chunk, result)
             return result
+
+    def _take_for_drain(self, force_all: bool) -> list[BufferedItem]:
+        """Pick the items to drain: whole closed turns, or everything under force/stall.
+
+        ``force_all`` (overflow / shutdown / atexit) drains the buffer outright.
+        Otherwise drain the flushable prefix and hold the open turn — but if that
+        held turn has stopped growing across drains for longer than the hold cap, it
+        has stalled: release it too rather than strand it (ungrouped-but-correct).
+        """
+        buf = self.client.buffer
+        if force_all:
+            self._held_since, self._last_held_count = None, 0
+            return buf.take_all()
+
+        items = buf.take_flushable()
+        held = len(buf)  # remaining = the current open turn's held tail
+        if held and buf.armed:
+            now = self.monotonic()
+            cap = max(self.interval_seconds, self.turn_hold_max_seconds)
+            if held != self._last_held_count:
+                # Turn still growing (or a new one opened) → not stalled; (re)start the clock.
+                self._held_since, self._last_held_count = now, held
+            elif self._held_since is not None and (now - self._held_since) >= cap:
+                items = items + buf.take_all()  # safety valve: release the stalled turn
+                self._held_since, self._last_held_count = None, 0
+        else:
+            self._held_since, self._last_held_count = None, 0
+        return items
 
     def _chunk_batches(self, items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         """Split items into batches under both the item-count and 5 MB byte caps.
@@ -408,6 +455,81 @@ class Flusher:
 
 class _ShipError(RuntimeError):
     pass
+
+
+def _assign_parallel_groups(items: list[BufferedItem]) -> None:
+    """Tag concurrently-dispatched tool calls with a shared ``parallel_group_id``.
+
+    Concurrency is read from causal structure, not adjacency: ``≥2 tool_call``
+    events that **share one issuing ``llm_call``** (same ``parent_event_id``, and
+    that parent is an ``llm_call``) came from a single assistant message — one
+    ``message_id`` = one turn = one ``llm_call`` — which is the Anthropic API's own
+    statement that those calls were dispatched together. This holds regardless of
+    how the CLI streams them: it interleaves a parallel turn as ``call A → result A
+    → call B → result B``, so an adjacency/"no result between" rule misses them —
+    but their shared issuer does not. The adapter can't assign this at capture time
+    (the first call is buffered before the second arrives); the flusher can, because
+    it sees the drained events together. Each grouped call's matching ``tool_result``
+    (linked via ``parent_event_id``) inherits the same group.
+
+    Sound by construction: it groups only calls that share an ``llm_call`` issuer
+    (never sequential calls, which each get their own turn/issuer; never a
+    fabricated group). Only limitation: a parallel batch split across two drains
+    isn't grouped — the earlier calls already shipped — which degrades to
+    "ungrouped" (honest), never to a wrong group. Mutates event dicts in place
+    before hashing, so the group id is part of the committed ``event_hash``. Events
+    already carrying a ``parallel_group_id`` (e.g. the manual ``parallel_group``
+    context) are left untouched.
+    """
+    # Pass 1: kind by event_id, so we can require a tool_call's parent be an llm_call.
+    kind_of: dict[str, str] = {}
+    for item in items:
+        if isinstance(item, BufferedEvent):
+            ev = item.event
+            kind_of[ev.get("event_id", "")] = ev.get("action", {}).get("kind", "")
+
+    # Pass 2: bucket tool_calls by their issuing llm_call (in first-seen order).
+    by_issuer: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for item in items:
+        if not isinstance(item, BufferedEvent):
+            continue
+        event = item.event
+        if event.get("action", {}).get("kind") != "tool_call":
+            continue
+        if "parallel_group_id" in event:
+            continue  # already grouped (manual parallel_group context) — leave it
+        parent = event.get("parent_event_id")
+        if not parent or kind_of.get(parent) != "llm_call":
+            continue  # no resolved issuer (race fallback) → can't claim concurrency
+        if parent not in by_issuer:
+            by_issuer[parent] = []
+            order.append(parent)
+        by_issuer[parent].append(event)
+
+    # Pass 3: one group per issuer that dispatched ≥2 calls; tag the calls.
+    call_group: dict[str, str] = {}  # tool_call event_id -> assigned group_id
+    for parent in order:
+        calls = by_issuer[parent]
+        if len(calls) < 2:
+            continue
+        group_id = generate_parallel_group_id()
+        for ev in calls:
+            ev["parallel_group_id"] = group_id
+            call_group[ev["event_id"]] = group_id
+
+    # Pass 4: each grouped call's tool_result (parented on the call) inherits it.
+    for item in items:
+        if not isinstance(item, BufferedEvent):
+            continue
+        event = item.event
+        if event.get("action", {}).get("kind") != "tool_result":
+            continue
+        if "parallel_group_id" in event:
+            continue
+        inherited = call_group.get(event.get("parent_event_id") or "")
+        if inherited is not None:
+            event["parallel_group_id"] = inherited
 
 
 def _serialize(payload: Any) -> tuple[bytes, str]:

@@ -33,7 +33,11 @@ Translation:
   ``elicitation_response`` → ``run_resume``
 - ``SubagentStart`` → ``delegate`` on the parent + a child run with ``delegated_from``;
   ``SubagentStop`` → end the child run
-- ``AssistantMessage`` (seen by :func:`observe_query`) → ``llm_call`` with ``model_ref``
+- ``AssistantMessage`` (seen by :func:`observe_query`) → ``llm_call`` with ``model_ref``.
+  The CLI streams one model turn as several ``AssistantMessage``s (Thinking / text /
+  ToolUse) sharing a ``message_id``; these are coalesced into ONE ``llm_call`` per
+  turn (tagged with ``labels.claude_message_id``) so the trail records real model
+  calls, not stream fragments.
 
 **Causal parenting (the event DAG, not a linear chain).** ``parent_event_id`` is the
 OTel-aligned causal primitive, distinct from ``local_seq`` (the ordering ordinal).
@@ -62,7 +66,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Optional
 
-from .._ids import generate_parallel_group_id, generate_run_id
+from .._ids import generate_run_id
 from ..client import get_instance
 from ..context import (
     current_parent_event,
@@ -154,9 +158,39 @@ def _active() -> bool:
     return inst is not None and not inst.disabled
 
 
+def _buffer() -> Any:
+    """The active SDK buffer, or ``None`` when the SDK isn't initialised.
+
+    The adapter drives turn-atomic flushing through it (arm + advance watermark) so
+    a model turn's events stay whole across the flusher's 2s cadence.
+    """
+    inst = get_instance()
+    return inst.buffer if inst is not None else None
+
+
 # --------------------------------------------------------------------------- #
 # Run registry (keyed by framework cursor, not ambient context)
 # --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Turn:
+    """A model turn being accumulated before its single ``llm_call`` is emitted.
+
+    The CLI streams one turn (one ``message_id``) as several ``AssistantMessage``s
+    — a ThinkingBlock, a text block, ToolUseBlock(s). We gather them all here and
+    emit ONE ``llm_call`` carrying the full content and the turn's cumulative usage,
+    rather than one event per fragment (which over-counted calls, lost the thinking
+    reasoning, and mis-attributed usage). The emission is deferred until the turn's
+    first tool fires (or the next turn / stream end), so the single ``llm_call``
+    still precedes — and is the parent of — its tool calls.
+    """
+
+    message_id: Optional[str]
+    model_ref: dict[str, Any]
+    content: list[Any] = field(default_factory=list)
+    otel: Optional[dict[str, Any]] = None
+    tool_use_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -166,18 +200,26 @@ class _CausalLinks:
 
     The SDK already states causality via ids — we do not infer it: ``tool_use_id``
     is the Anthropic Messages API correlation id, identical on a tool's call and
-    its result; an ``AssistantMessage`` carrying >1 ``ToolUseBlock`` is the API's
-    own statement that those calls are concurrent. We record those ids here and
-    map them onto ``parent_event_id`` / ``parallel_group_id`` so the chain stops
-    asserting the false "previous event is my parent" edge.
+    its result. We record those ids here and map them onto ``parent_event_id`` so
+    the chain stops asserting the false "previous event is my parent" edge.
+    (Concurrency grouping is decided downstream by the flusher: tool calls that
+    share one issuing ``llm_call`` came from a single assistant message and are
+    grouped — never guessed here from arrival adjacency.)
     """
 
     #: tool_use_id → the ``tool_call`` event_id (so its ``tool_result`` parents on it)
     call_event: dict[str, str] = field(default_factory=dict)
     #: tool_use_id → the ``llm_call`` event_id that issued it (the ``tool_call``'s parent)
     issuer_event: dict[str, str] = field(default_factory=dict)
-    #: tool_use_id → parallel_group_id (only when its assistant turn issued >1 tool)
-    group: dict[str, str] = field(default_factory=dict)
+    #: The turn being accumulated (lazy emission), and the last EMITTED turn's
+    #: ``llm_call`` event_id (the parent a fallback tool call resolves to).
+    pending: Optional[_Turn] = None
+    current_llm_event_id: Optional[str] = None
+    #: message_id of the last EMITTED turn. The CLI may stream more tool_use blocks
+    #: of the SAME turn AFTER its first tool already forced emission (a parallel
+    #: fan-out arrives as call a / result a / call b …); those late blocks must
+    #: attach to the already-emitted llm_call as their issuer, NOT open a 2nd turn.
+    emitted_message_id: Optional[str] = None
 
 
 class _Registry:
@@ -198,6 +240,11 @@ class _Registry:
                 links = _CausalLinks()
                 self._links[run.run_id] = links
             return links
+
+    def peek_session(self, session_id: str) -> Optional[Run]:
+        """The session's run if it exists, without creating one (for teardown)."""
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def get_or_create_session(
         self, session_id: str, agent_identity: str, conversation_id: Optional[str]
@@ -227,6 +274,11 @@ class _Registry:
     ) -> None:
         with self._lock:
             self._subagents[(session_id, agent_id)] = child
+
+    def peek_subagent(self, session_id: str, agent_id: str) -> Optional[Run]:
+        """The subagent's run if it exists, without removing it (for teardown)."""
+        with self._lock:
+            return self._subagents.get((session_id, agent_id))
 
     def pop_subagent(self, session_id: str, agent_id: str) -> Optional[Run]:
         with self._lock:
@@ -286,33 +338,23 @@ def _sha256_hex(value: Any) -> str:
 
 def _call_links(links: _CausalLinks, tool_use_id: Optional[str]) -> dict[str, Any]:
     """``capture_event`` kwargs for a ``tool_call``: parent on the ``llm_call`` that
-    issued it and join the assistant turn's parallel group, both keyed by the SDK's
-    ``tool_use_id``. Returns ``{}`` (→ ambient parent) when the issuing turn hasn't
-    been observed yet — a benign race fallback, never a fabricated edge."""
-    out: dict[str, Any] = {}
-    if not tool_use_id:
-        return out
-    if tool_use_id in links.issuer_event:
-        out["parent_event_id"] = links.issuer_event[tool_use_id]
-    if tool_use_id in links.group:
-        out["parallel_group_id"] = links.group[tool_use_id]
-    return out
+    issued it, keyed by the SDK's ``tool_use_id``. Returns ``{}`` (→ ambient parent)
+    when the issuing turn hasn't been observed yet — a benign race fallback, never a
+    fabricated edge. (Parallel grouping is assigned later by the flusher.)"""
+    if tool_use_id and tool_use_id in links.issuer_event:
+        return {"parent_event_id": links.issuer_event[tool_use_id]}
+    return {}
 
 
 def _result_links(links: _CausalLinks, tool_use_id: Optional[str]) -> dict[str, Any]:
     """``capture_event`` kwargs for a ``tool_result``: parent on its own
-    ``tool_call`` (matched by ``tool_use_id``, not arrival order) and join the same
-    parallel group. Pops the call mapping — a tool_use_id yields exactly one result.
-    Returns ``{}`` (→ ambient parent) when the call wasn't recorded (race)."""
-    out: dict[str, Any] = {}
+    ``tool_call`` (matched by ``tool_use_id``, not arrival order). Pops the call
+    mapping — a tool_use_id yields exactly one result. Returns ``{}`` (→ ambient
+    parent) when the call wasn't recorded (race)."""
     if not tool_use_id:
-        return out
+        return {}
     parent = links.call_event.pop(tool_use_id, None)
-    if parent is not None:
-        out["parent_event_id"] = parent
-    if tool_use_id in links.group:
-        out["parallel_group_id"] = links.group[tool_use_id]
-    return out
+    return {"parent_event_id": parent} if parent is not None else {}
 
 
 def build_hooks(
@@ -344,6 +386,9 @@ def build_hooks(
         try:
             run = route(input_data)
             links = _registry.links_for(run)
+            # Emit this turn's accumulated llm_call BEFORE its first tool, so the
+            # single llm_call precedes (and is the parent of) the tool call.
+            _emit_pending_turn(run, links)
             tuid = tool_use_id or input_data.get("tool_use_id")
             with _bound(run):
                 event_id = capture_event(
@@ -478,9 +523,16 @@ def build_hooks(
         if not _active():
             return {}
         try:
-            child = _registry.pop_subagent(input_data["session_id"], input_data.get("agent_id", ""))
+            session_id, agent_id = input_data["session_id"], input_data.get("agent_id", "")
+            child = _registry.peek_subagent(session_id, agent_id)
+            if child is not None:
+                _emit_pending_turn(child, _registry.links_for(child))  # flush its last turn
+            child = _registry.pop_subagent(session_id, agent_id)
             if child is not None:
                 emit_run_end(child, outcome="success")
+                buf = _buffer()
+                if buf is not None:
+                    buf.advance_flush_watermark()  # release the child's final turn + run_end
         except Exception:
             pass
         return {}
@@ -594,61 +646,168 @@ def _session_id_of(message: Any) -> Optional[str]:
     return None
 
 
-def _maybe_capture_llm(run: Run, message: Any) -> None:
-    """Emit an ``llm_call`` for an AssistantMessage (the model-call evidence hooks
-    don't provide)."""
+def _accumulate_turn(run: Run, message: Any) -> None:
+    """Fold an ``AssistantMessage`` into the run's pending model turn (lazy emission).
+
+    The CLI streams one turn as several ``AssistantMessage``s sharing a
+    ``message_id`` (Thinking / text / ToolUse). We accumulate their content and the
+    turn's (cumulative) usage in :class:`_Turn` and emit a single ``llm_call`` only
+    when the turn completes — at its first tool, the next turn, or stream end (see
+    :func:`_emit_pending_turn`). This records one call per real turn, captures the
+    full reasoning (incl. ``ThinkingBlock.thinking``), and attributes the turn's
+    true cumulative usage — without losing later blocks or mutating a shipped event.
+    """
     if type(message).__name__ != "AssistantMessage":
         return
     model_id = getattr(message, "model", None)
     if not model_id:
         return
-    usage = getattr(message, "usage", None) or {}
-    model_ref: dict[str, Any] = {"provider": "anthropic", "model_id": model_id}
-    if isinstance(usage, dict):
-        if "input_tokens" in usage:
-            model_ref["input_tokens"] = usage["input_tokens"]
-        if "output_tokens" in usage:
-            model_ref["output_tokens"] = usage["output_tokens"]
+    links = _registry.links_for(run)
+    message_id = getattr(message, "message_id", None)
     content = getattr(message, "content", None)
+
+    # Late block of a turn we ALREADY emitted: the CLI streamed another tool_use of
+    # the same message_id after its first tool forced emission (the parallel fan-out
+    # call a / result a / call b …). Don't open a second turn — bind these tool_use
+    # ids to the already-emitted llm_call so co-issued calls share one issuer (and
+    # the flusher groups them). This is what keeps an interleaved fan-out as ONE
+    # llm_call instead of one per tool.
+    if (
+        links.pending is None
+        and message_id is not None
+        and message_id == links.emitted_message_id
+    ):
+        if links.current_llm_event_id and isinstance(content, list):
+            for block in content:
+                if type(block).__name__ == "ToolUseBlock" and getattr(block, "id", None):
+                    links.issuer_event[block.id] = links.current_llm_event_id
+        return
+
+    # New turn (different message_id, or none open) → close the previous one first.
+    if links.pending is None or (message_id is not None and message_id != links.pending.message_id):
+        _emit_pending_turn(run, links)
+        links.pending = _Turn(
+            message_id=message_id,
+            model_ref={"provider": "anthropic", "model_id": model_id},
+        )
+
+    turn = links.pending
+    fragment = _stringify_content(content)
+    if isinstance(fragment, list):
+        turn.content.extend(fragment)
+    elif fragment is not None:
+        turn.content.append(fragment)
+    # Streamed usage is cumulative per message, so the latest block carries the
+    # turn total — overwrite rather than sum.
+    usage_fields, otel_usage = _model_usage(getattr(message, "usage", None))
+    if usage_fields:
+        turn.model_ref.update(usage_fields)
+    if otel_usage is not None:
+        turn.otel = otel_usage
+    if isinstance(content, list):
+        for block in content:
+            if type(block).__name__ == "ToolUseBlock" and getattr(block, "id", None):
+                turn.tool_use_ids.append(block.id)
+
+
+def _emit_pending_turn(run: Run, links: _CausalLinks) -> None:
+    """Emit the pending turn's single ``llm_call`` and register its tool issuers.
+
+    Idempotent: a no-op when no turn is open. Called when a turn completes — its
+    first tool fires, the next turn begins, or the stream ends — so the one
+    ``llm_call`` is captured (and assigned its ``local_seq``) before any of its tool
+    calls, making it their true parent. Concurrency grouping is left to the flusher.
+    """
+    turn = links.pending
+    if turn is None:
+        return
+    links.pending = None
+    links.emitted_message_id = turn.message_id
+    # Turn-atomic flushing: the PREVIOUS turn is now complete — all its events
+    # (incl. tools interleaved as call a / result a / call b under one message_id —
+    # see turn-atomic-flushing.md) are buffered — so release it. This turn's
+    # llm_call and the tools that follow become the new held-open turn, kept whole
+    # in one drain so the flusher can group its concurrent fan-out.
+    buf = _buffer()
+    if buf is not None:
+        buf.arm_turn_atomic()
+        buf.advance_flush_watermark()
+    extra: dict[str, Any] = {}
+    if turn.otel is not None:
+        extra["otel_attributes"] = turn.otel
+    if turn.message_id is not None:
+        extra["labels"] = {"claude_message_id": turn.message_id}
     with _bound(run):
         llm_event_id = capture_event(
             kind="llm_call",
             name="messages.create",
-            model_ref=model_ref,
-            payload={"content": _stringify_content(content)},
+            model_ref=turn.model_ref,
+            payload={"content": turn.content},
+            **extra,
         )
-    _register_tool_issuers(run, content, llm_event_id)
+    links.current_llm_event_id = llm_event_id
+    if llm_event_id:
+        for tuid in turn.tool_use_ids:
+            links.issuer_event[tuid] = llm_event_id
 
 
-def _register_tool_issuers(run: Run, content: Any, llm_event_id: str) -> None:
-    """Record, from an AssistantMessage's ``ToolUseBlock``s, the causal links the
-    tool hooks consume: each ``tool_use_id`` → this ``llm_call`` (its parent), and —
-    when one message carries >1 tool_use block (the API's own statement that the
-    calls are concurrent) — a shared ``parallel_group_id``.
+def _model_usage(usage: Any) -> tuple[dict[str, int], Optional[dict[str, Any]]]:
+    """Map an Anthropic ``usage`` dict to ``(model_ref token fields, otel_attributes)``.
 
-    Best-effort grouping: the CLI may stream a turn's tool_use blocks as separate
-    AssistantMessages (each its own llm_call), in which case they share a
-    ``message_id`` but are not grouped here — only co-resident blocks are. Parenting
-    is unaffected and remains correct in both cases. (Regrouping streamed siblings
-    by ``message_id`` is a future flusher-side step.)"""
-    if not llm_event_id or not isinstance(content, list):
-        return
-    tool_use_ids = [
-        block.id
-        for block in content
-        if type(block).__name__ == "ToolUseBlock" and getattr(block, "id", None)
-    ]
-    if not tool_use_ids:
-        return
-    links = _registry.links_for(run)
-    group_id = generate_parallel_group_id() if len(tool_use_ids) > 1 else None
-    for tuid in tool_use_ids:
-        links.issuer_event[tuid] = llm_event_id
-        if group_id is not None:
-            links.group[tuid] = group_id
+    With prompt caching the bare ``input_tokens`` is only the *non-cached* delta —
+    typically a handful of tokens — which badly understates the prompt the model
+    actually processed (the bulk arrives as ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``). So ``model_ref.input_tokens`` is the TRUE
+    input — uncached + cache-read + cache-creation — and the cached/uncached
+    breakdown is preserved in ``otel_attributes.extra`` for cost analysis.
+    """
+    if not isinstance(usage, dict):
+        return {}, None
+
+    def _int(key: str) -> int:
+        value = usage.get(key)
+        return value if isinstance(value, int) else 0
+
+    uncached = _int("input_tokens")
+    cache_read = _int("cache_read_input_tokens")
+    cache_creation = _int("cache_creation_input_tokens")
+    output = _int("output_tokens")
+    total_input = uncached + cache_read + cache_creation
+
+    fields: dict[str, int] = {}
+    if total_input:
+        fields["input_tokens"] = total_input
+    if output or "output_tokens" in usage:
+        fields["output_tokens"] = output
+    if not fields:
+        return {}, None
+
+    otel: dict[str, Any] = {
+        "gen_ai_usage_input_tokens": total_input,
+        "gen_ai_usage_output_tokens": output,
+    }
+    breakdown: dict[str, Any] = {}
+    if cache_read or cache_creation:
+        # Only worth recording the split when caching actually occurred.
+        breakdown["uncached_input_tokens"] = uncached
+        if cache_read:
+            breakdown["cache_read_input_tokens"] = cache_read
+        if cache_creation:
+            breakdown["cache_creation_input_tokens"] = cache_creation
+    if breakdown:
+        otel["extra"] = breakdown
+    return fields, otel
 
 
 def _stringify_content(content: Any) -> Any:
+    """Render an AssistantMessage's content blocks to capturable strings.
+
+    Each block exposes its payload on a DIFFERENT attribute: ``TextBlock.text``,
+    ``ThinkingBlock.thinking`` (the model's extended-thinking reasoning — the
+    "why"), ``ToolUseBlock.name``/``input``. Reading only ``.text`` (the old bug)
+    silently discarded every thinking block as the bare token "ThinkingBlock",
+    losing the reasoning behind a decision. We pull each block's real content.
+    """
     if content is None:
         return None
     if isinstance(content, str):
@@ -656,7 +815,20 @@ def _stringify_content(content: Any) -> Any:
     out = []
     for block in content if isinstance(content, list) else [content]:
         text = getattr(block, "text", None)
-        out.append(text if text is not None else type(block).__name__)
+        if text is not None:
+            out.append(text)
+            continue
+        thinking = getattr(block, "thinking", None)  # ThinkingBlock — the reasoning
+        if thinking is not None:
+            # Opus omits thinking text by default (signature only) → empty string;
+            # record that the model thought rather than emitting blank noise. Pass
+            # thinking={"display": "summarized"} in options to capture the text.
+            out.append(thinking if thinking else "[thinking omitted by model]")
+            continue
+        # ToolUseBlock etc.: the full input is captured on the tool_call event, so
+        # here record a useful descriptor (name) rather than the bare type name.
+        name = getattr(block, "name", None)
+        out.append(f"{type(block).__name__}:{name}" if name is not None else type(block).__name__)
     return out
 
 
@@ -701,13 +873,21 @@ async def observe_query(
             if sid is not None:
                 seen.add(sid)
                 run = _registry.get_or_create_session(sid, agent_identity, conversation_id)
-                _maybe_capture_llm(run, message)
+                _accumulate_turn(run, message)
             yield message
     except BaseException:
         outcome = "failure"
         raise
     finally:
         for sid in seen:
+            open_run = _registry.peek_session(sid)
+            if open_run is not None:
+                # Flush the final turn (e.g. a closing summary with no tool call)
+                # before the run ends, so its llm_call precedes run_end.
+                _emit_pending_turn(open_run, _registry.links_for(open_run))
             ended = _registry.pop_session(sid)
             if ended is not None:
                 emit_run_end(ended, outcome=outcome)
+                buf = _buffer()
+                if buf is not None:
+                    buf.advance_flush_watermark()  # release the final turn + run_end
