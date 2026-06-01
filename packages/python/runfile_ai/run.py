@@ -91,21 +91,34 @@ def _default_actor(run: Run) -> dict[str, str]:
     return {"type": "agent", "agent_identity": run.agent_identity}
 
 
+#: Sentinel distinguishing "caller did not pass this" from an explicit ``None``.
+#: An explicit ``parent_event_id`` (even ``None``) means "this is a real causal
+#: edge the adapter resolved" — it is used verbatim AND it does not advance the
+#: ambient parent spine, so a branch event (e.g. a ``tool_result`` parented on
+#: its ``tool_call``) never leaks into the next ambient-threaded event's parent.
+_UNSET: Any = object()
+
+
 def _build_event(
     run: Run,
     *,
     kind: str,
     name: str,
     actor: Optional[dict[str, Any]] = None,
+    parent_event_id: Any = _UNSET,
+    parallel_group_id: Any = _UNSET,
     **extra: Any,
 ) -> tuple[str, dict[str, Any]]:
     inst = _require_instance()
     event_id = generate_event_id()
+    # An explicit parent_event_id (incl. None) wins over the ambient parent; the
+    # sentinel means "fall back to the ambient linear thread" (manual API, llm_call).
+    parent = parent_event_id if parent_event_id is not _UNSET else current_parent_event()
     event: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION_FULL,
         "event_id": event_id,
         "run_id": run.run_id,
-        "parent_event_id": current_parent_event(),
+        "parent_event_id": parent,
         "segment_index": run.segment_index,
         "local_seq": run.next_local_seq(),
         "captured_at": utc_now_iso(),
@@ -116,9 +129,10 @@ def _build_event(
         "redaction_policy_version": inst.redaction_policy_version,
         "environment": inst.environment,
     }
-    parallel_group_id = current_parallel_group()
-    if parallel_group_id is not None:
-        event["parallel_group_id"] = parallel_group_id
+    # Explicit group (incl. None to force "ungrouped") wins over the ambient group.
+    group = parallel_group_id if parallel_group_id is not _UNSET else current_parallel_group()
+    if group is not None:
+        event["parallel_group_id"] = group
     # action_extra merges into the action sub-object (outcome, duration_ms) rather
     # than becoming a stray top-level field.
     action_extra = extra.pop("action_extra", None)
@@ -137,20 +151,37 @@ def _emit_event(
     name: str,
     payload: Any = None,
     actor: Optional[dict[str, Any]] = None,
+    parent_event_id: Any = _UNSET,
+    parallel_group_id: Any = _UNSET,
     **extra: Any,
 ) -> str:
     """Construct one event's metadata, stash its cleartext payload, buffer it.
 
-    Returns the new event_id (empty if the run was overflow-dropped). Sets it as
-    the ambient parent for the next event.
+    Returns the new event_id (empty if the run was overflow-dropped).
+
+    Parent threading: without an explicit ``parent_event_id``, the event takes the
+    ambient parent and then becomes the ambient parent for the next event (the
+    linear spine the manual API and ``llm_call`` capture rely on). With an explicit
+    ``parent_event_id``, the event is a resolved causal branch — it uses that parent
+    and does NOT advance the spine, so e.g. a ``tool_result`` parented on its
+    ``tool_call`` never becomes the parent of the following ``llm_call``.
     """
     if run.dropped:
         return ""
     if _require_instance().disabled:
         return ""  # disabled SDK: silent no-op
-    event_id, event = _build_event(run, kind=kind, name=name, actor=actor, **extra)
+    event_id, event = _build_event(
+        run,
+        kind=kind,
+        name=name,
+        actor=actor,
+        parent_event_id=parent_event_id,
+        parallel_group_id=parallel_group_id,
+        **extra,
+    )
     _buffer_append(run, BufferedEvent(event=event, raw_payload=payload, run=run))
-    set_parent_event(event_id)
+    if parent_event_id is _UNSET:
+        set_parent_event(event_id)
     return event_id
 
 
@@ -402,10 +433,27 @@ def abandon_run(*, reason: Optional[str] = None, run_id: Optional[str] = None) -
 
 
 def capture_event(*, kind: str, name: str, payload: Any = None, **fields: Any) -> str:
-    """Manually capture one event within the current run. Returns the event_id."""
+    """Manually capture one event within the current run. Returns the event_id.
+
+    ``parent_event_id`` and ``parallel_group_id`` may be passed to set a resolved
+    causal edge / concurrency group explicitly (framework adapters that can derive
+    true causality from native ids do this); omitting them falls back to the
+    ambient linear parent and ambient parallel group.
+    """
     run = _require_run()
     actor = fields.pop("actor", None)
-    return _emit_event(run, kind=kind, name=name, payload=payload, actor=actor, **fields)
+    parent_event_id = fields.pop("parent_event_id", _UNSET)
+    parallel_group_id = fields.pop("parallel_group_id", _UNSET)
+    return _emit_event(
+        run,
+        kind=kind,
+        name=name,
+        payload=payload,
+        actor=actor,
+        parent_event_id=parent_event_id,
+        parallel_group_id=parallel_group_id,
+        **fields,
+    )
 
 
 @contextmanager

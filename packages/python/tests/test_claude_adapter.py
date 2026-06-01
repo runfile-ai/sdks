@@ -62,12 +62,20 @@ class _TextBlock:
         self.text = text
 
 
+class ToolUseBlock:  # name matters: adapter checks type(...).__name__
+    def __init__(self, id: str, name: str = "tool", input: dict | None = None) -> None:
+        self.id = id
+        self.name = name
+        self.input = input or {}
+
+
 class AssistantMessage:  # name matters: adapter checks type(...).__name__
-    def __init__(self, content, model, session_id, usage=None) -> None:
+    def __init__(self, content, model, session_id, usage=None, message_id=None) -> None:
         self.content = content
         self.model = model
         self.session_id = session_id
         self.usage = usage or {}
+        self.message_id = message_id
         self.parent_tool_use_id = None
 
 
@@ -375,6 +383,100 @@ async def test_observe_query_failure_outcome(sdk, fake_claude) -> None:
             pass
     ends = [i for i in _run_items(sdk.buffer) if i["type"] == "run_end"]
     assert ends and ends[-1]["outcome"] == "failure"
+    _assert_all_wire_valid(sdk.buffer)
+
+
+async def test_tool_result_parents_on_its_own_tool_call_under_interleave(sdk, fake_claude) -> None:
+    """Causal parenting via tool_use_id, not arrival order.
+
+    Two tools are dispatched (t1 then t2) but complete in inverted order (t2 then
+    t1) — the real concurrency signature. Each tool_result must parent on its OWN
+    tool_call (matched by tool_use_id), and the last result (t1) must NOT parent on
+    the previous-by-seq event (t2's result) the way the old linear chain did.
+    """
+
+    async def fake_query(*, prompt, options=None, **kw):
+        pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
+        post = (options.hooks or {})["PostToolUse"][0].hooks[0]
+        # turn 1 issues tool t1 (its own assistant message)
+        yield AssistantMessage(content=[ToolUseBlock(id="t1", name="policy")], model="claude-opus-4-8", session_id="s1", message_id="m1")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="policy", tool_input={}, tool_use_id="t1"), "t1", None)
+        # turn 2 issues tool t2
+        yield AssistantMessage(content=[ToolUseBlock(id="t2", name="bureau")], model="claude-opus-4-8", session_id="s1", message_id="m2")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="bureau", tool_input={}, tool_use_id="t2"), "t2", None)
+        # results return inverted: t2 first, then t1
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="bureau", tool_response={"ok": 2}, tool_use_id="t2"), "t2", None)
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="policy", tool_response={"ok": 1}, tool_use_id="t1"), "t1", None)
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+
+    events = _events(sdk.buffer)
+    by = lambda kind, name: next(e for e in events if e["action"]["kind"] == kind and e["action"]["name"] == name)
+    llm1, llm2 = [e for e in events if e["action"]["kind"] == "llm_call"][:2]
+    call_t1, call_t2 = by("tool_call", "policy"), by("tool_call", "bureau")
+    res_t1, res_t2 = by("tool_result", "policy"), by("tool_result", "bureau")
+
+    # each tool_call parents on the llm_call that issued it
+    assert call_t1["parent_event_id"] == llm1["event_id"]
+    assert call_t2["parent_event_id"] == llm2["event_id"]
+    # each tool_result parents on its OWN tool_call (matched by tool_use_id)
+    assert res_t2["parent_event_id"] == call_t2["event_id"]
+    assert res_t1["parent_event_id"] == call_t1["event_id"]
+    # the regression: t1's result was emitted last but does NOT chain to t2's result
+    assert res_t1["local_seq"] > res_t2["local_seq"]
+    assert res_t1["parent_event_id"] != res_t2["event_id"]
+    # next llm spine wasn't polluted by the branch events (tool events don't advance it)
+    assert llm2["parent_event_id"] == llm1["event_id"]
+    _assert_all_wire_valid(sdk.buffer)
+
+
+async def test_parallel_tool_calls_in_one_message_share_a_group(sdk, fake_claude) -> None:
+    """One AssistantMessage with >1 ToolUseBlock = the API's statement that the
+    calls are concurrent → all four events (2 calls + 2 results) share one
+    parallel_group_id and both calls parent on the single issuing llm_call."""
+
+    async def fake_query(*, prompt, options=None, **kw):
+        pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
+        post = (options.hooks or {})["PostToolUse"][0].hooks[0]
+        yield AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="a"), ToolUseBlock(id="t2", name="b")],
+            model="claude-opus-4-8", session_id="s1", message_id="m1",
+        )
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="a", tool_input={}, tool_use_id="t1"), "t1", None)
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="b", tool_input={}, tool_use_id="t2"), "t2", None)
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="a", tool_response={}, tool_use_id="t1"), "t1", None)
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="b", tool_response={}, tool_use_id="t2"), "t2", None)
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+
+    events = _events(sdk.buffer)
+    llm = [e for e in events if e["action"]["kind"] == "llm_call"][0]
+    tool_events = [e for e in events if e["action"]["kind"] in ("tool_call", "tool_result")]
+    groups = {e.get("parallel_group_id") for e in tool_events}
+    assert len(groups) == 1 and None not in groups  # one shared, real group id
+    assert (next(iter(groups))).startswith("pg_")
+    for e in [e for e in tool_events if e["action"]["kind"] == "tool_call"]:
+        assert e["parent_event_id"] == llm["event_id"]  # both calls parent on the one turn
+    _assert_all_wire_valid(sdk.buffer)
+
+
+async def test_single_tool_call_has_no_parallel_group(sdk, fake_claude) -> None:
+    async def fake_query(*, prompt, options=None, **kw):
+        pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
+        post = (options.hooks or {})["PostToolUse"][0].hooks[0]
+        yield AssistantMessage(content=[ToolUseBlock(id="t1", name="a")], model="claude-opus-4-8", session_id="s1", message_id="m1")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="a", tool_input={}, tool_use_id="t1"), "t1", None)
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="a", tool_response={}, tool_use_id="t1"), "t1", None)
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+    tool_events = [e for e in _events(sdk.buffer) if e["action"]["kind"] in ("tool_call", "tool_result")]
+    assert all("parallel_group_id" not in e for e in tool_events)
     _assert_all_wire_valid(sdk.buffer)
 
 
