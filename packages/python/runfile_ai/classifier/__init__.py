@@ -11,6 +11,11 @@ Honest caveats:
   fact that whatever is missed is still encrypted at rest.
 - It is policy-driven: only classes the policy has a rule for are acted on
   (others pass through). Trial tenants get a safe-default policy server-side.
+- A string leaf that is itself a JSON object/array (e.g. an MCP tool result
+  delivered as text) is parsed and redacted field-by-field, then re-embedded as
+  a string — otherwise value-anchored detectors would miss values buried in the
+  blob. A bare first name / standalone date still needs a precise policy pattern
+  or schema-level ``data_classification`` tagging; that's a policy concern.
 - ``tokenize``/``tokenize_with_fallback`` currently fall back to ``drop`` (no
   Vault round-trip yet) — wiring the Vault is the next slice. Dropped, not leaked.
 """
@@ -18,6 +23,7 @@ Honest caveats:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
@@ -70,6 +76,24 @@ class _Rule:
     pattern: re.Pattern[str]
 
 
+def _as_json_container(text: str) -> Any | None:
+    """Return the parsed value if ``text`` is a JSON object/array, else ``None``.
+
+    Restricted to objects/arrays (never bare scalars) so we never coerce a string
+    like ``"123"`` to an int or ``"true"`` to a bool, and only when it parses
+    cleanly. Used to redact structured fields inside JSON-string payloads (tool
+    results), which a flat-string walk would otherwise treat as one opaque leaf.
+    """
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
+
+
 def _luhn_ok(value: str) -> bool:
     digits = [int(c) for c in value if c.isdigit()]
     if not 13 <= len(digits) <= 19:
@@ -114,6 +138,16 @@ class Redactor:
 
         def walk(value: Any) -> Any:
             if isinstance(value, str):
+                # Tool results commonly arrive as a JSON *string* — one opaque leaf
+                # (e.g. an MCP text result). Walking it as a flat string hides the
+                # real fields from value-anchored detectors: a `^\d{4}-\d{2}-\d{2}$`
+                # dob rule can't match a date embedded mid-blob, so it would leak
+                # while unanchored rules (email, full name) still hit substrings.
+                # Parse embedded JSON objects/arrays so redaction sees structured
+                # leaves, then re-embed as a string to preserve the payload's shape.
+                container = _as_json_container(value)
+                if container is not None:
+                    return json.dumps(walk(container), separators=(",", ":"), default=str)
                 return redact_str(value)
             if isinstance(value, dict):
                 return {k: walk(v) for k, v in value.items()}

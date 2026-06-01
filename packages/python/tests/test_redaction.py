@@ -97,6 +97,42 @@ def test_custom_detector_pattern_from_policy() -> None:
     assert result.value == "acct [REDACTED:internal_id]"
 
 
+def test_json_string_payload_is_redacted_structurally() -> None:
+    """A tool result delivered as a JSON *string* (one opaque leaf) must still be
+    redacted field-by-field — otherwise a value-anchored detector can't match a
+    value embedded mid-blob and leaks it (the live MCP tool_result case)."""
+    blob = (
+        '{"customer":{"full_name":"Dana Whitfield",'
+        '"date_of_birth":"1987-04-02","email":"alice@example.com"}}'
+    )
+    result = Redactor().apply(
+        blob,
+        _policy(
+            [
+                {"classification": "email_address", "treatment": "drop"},
+                # Anchored to a whole bare date — only matches an isolated leaf,
+                # so it would miss the embedded date if the blob weren't parsed.
+                {"classification": "dob", "treatment": "drop", "detector": {"pattern": r"^\d{4}-\d{2}-\d{2}$"}},
+            ]
+        ),
+    )
+    assert isinstance(result.value, str)  # shape preserved: string in → string out
+    assert "1987-04-02" not in result.value  # dob no longer leaks
+    assert "alice@example.com" not in result.value
+    assert "[REDACTED:dob]" in result.value
+    assert sorted(result.redacted_classes) == ["dob", "email_address"]
+
+
+def test_non_json_string_is_left_as_flat_text() -> None:
+    # A string that merely starts oddly but isn't a JSON container is untouched
+    # by the structural path (still subject to normal substring detectors).
+    result = Redactor().apply(
+        "{not valid json} contact a@b.co",
+        _policy([{"classification": "email_address", "treatment": "drop"}]),
+    )
+    assert result.value == "{not valid json} contact [REDACTED:email_address]"
+
+
 def test_end_to_end_redaction_before_encryption(fake_ingest: FakeIngest) -> None:
     fake_ingest.policy_rules = [{"classification": "email_address", "treatment": "drop"}]
     inst = runfile_ai.init(

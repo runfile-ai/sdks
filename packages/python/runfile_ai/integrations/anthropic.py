@@ -35,6 +35,19 @@ Translation:
   ``SubagentStop`` → end the child run
 - ``AssistantMessage`` (seen by :func:`observe_query`) → ``llm_call`` with ``model_ref``
 
+**Causal parenting (the event DAG, not a linear chain).** ``parent_event_id`` is the
+OTel-aligned causal primitive, distinct from ``local_seq`` (the ordering ordinal).
+We resolve it from the SDK's *own* ids, never from arrival order: the Anthropic
+``tool_use_id`` (identical on a tool's call and result) parents each ``tool_result``
+on its ``tool_call``, and each ``tool_call`` on the ``llm_call`` whose
+``AssistantMessage`` carried that ``tool_use`` block. When one ``AssistantMessage``
+carries more than one ``ToolUseBlock`` — the API's own statement that the calls are
+concurrent — those events share a ``parallel_group_id``. (Tool-use blocks the CLI
+*streams* as separate AssistantMessages are parented correctly but not yet grouped;
+regrouping streamed siblings by ``message_id`` is a future flusher-side step.) These
+causal edges are set explicitly, so they do not advance the ambient linear parent —
+a ``tool_result`` never becomes the parent of the next ``llm_call``.
+
 Every hook returns ``{}`` (an empty ``HookJSONOutput``): the adapter observes, it
 never alters the agent's behaviour.
 """
@@ -46,9 +59,10 @@ import importlib.metadata
 import json
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Optional
 
-from .._ids import generate_run_id
+from .._ids import generate_parallel_group_id, generate_run_id
 from ..client import get_instance
 from ..context import (
     current_parent_event,
@@ -145,6 +159,27 @@ def _active() -> bool:
 # --------------------------------------------------------------------------- #
 
 
+@dataclass
+class _CausalLinks:
+    """Per-run scratch mapping the Claude SDK's native ``tool_use_id`` onto the
+    causal edges of the event DAG.
+
+    The SDK already states causality via ids — we do not infer it: ``tool_use_id``
+    is the Anthropic Messages API correlation id, identical on a tool's call and
+    its result; an ``AssistantMessage`` carrying >1 ``ToolUseBlock`` is the API's
+    own statement that those calls are concurrent. We record those ids here and
+    map them onto ``parent_event_id`` / ``parallel_group_id`` so the chain stops
+    asserting the false "previous event is my parent" edge.
+    """
+
+    #: tool_use_id → the ``tool_call`` event_id (so its ``tool_result`` parents on it)
+    call_event: dict[str, str] = field(default_factory=dict)
+    #: tool_use_id → the ``llm_call`` event_id that issued it (the ``tool_call``'s parent)
+    issuer_event: dict[str, str] = field(default_factory=dict)
+    #: tool_use_id → parallel_group_id (only when its assistant turn issued >1 tool)
+    group: dict[str, str] = field(default_factory=dict)
+
+
 class _Registry:
     """Process-global map of Claude ``session_id`` / subagent ``agent_id`` → Run."""
 
@@ -152,6 +187,17 @@ class _Registry:
         self._lock = threading.Lock()
         self._sessions: dict[str, Run] = {}
         self._subagents: dict[tuple[str, str], Run] = {}
+        # Causal-link scratch keyed by run_id; cleared when the run is popped.
+        self._links: dict[str, _CausalLinks] = {}
+
+    def links_for(self, run: Run) -> _CausalLinks:
+        """The causal-link scratch for ``run``, created on first use."""
+        with self._lock:
+            links = self._links.get(run.run_id)
+            if links is None:
+                links = _CausalLinks()
+                self._links[run.run_id] = links
+            return links
 
     def get_or_create_session(
         self, session_id: str, agent_identity: str, conversation_id: Optional[str]
@@ -171,7 +217,10 @@ class _Registry:
 
     def pop_session(self, session_id: str) -> Optional[Run]:
         with self._lock:
-            return self._sessions.pop(session_id, None)
+            run = self._sessions.pop(session_id, None)
+            if run is not None:
+                self._links.pop(run.run_id, None)
+            return run
 
     def create_subagent(
         self, session_id: str, agent_id: str, child: Run
@@ -181,7 +230,10 @@ class _Registry:
 
     def pop_subagent(self, session_id: str, agent_id: str) -> Optional[Run]:
         with self._lock:
-            return self._subagents.pop((session_id, agent_id), None)
+            run = self._subagents.pop((session_id, agent_id), None)
+            if run is not None:
+                self._links.pop(run.run_id, None)
+            return run
 
     def route(
         self, session_id: str, agent_id: Optional[str], agent_identity: str, conversation_id: Optional[str]
@@ -199,6 +251,7 @@ class _Registry:
         with self._lock:
             self._sessions.clear()
             self._subagents.clear()
+            self._links.clear()
 
 
 _registry = _Registry()
@@ -231,6 +284,37 @@ def _sha256_hex(value: Any) -> str:
     return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _call_links(links: _CausalLinks, tool_use_id: Optional[str]) -> dict[str, Any]:
+    """``capture_event`` kwargs for a ``tool_call``: parent on the ``llm_call`` that
+    issued it and join the assistant turn's parallel group, both keyed by the SDK's
+    ``tool_use_id``. Returns ``{}`` (→ ambient parent) when the issuing turn hasn't
+    been observed yet — a benign race fallback, never a fabricated edge."""
+    out: dict[str, Any] = {}
+    if not tool_use_id:
+        return out
+    if tool_use_id in links.issuer_event:
+        out["parent_event_id"] = links.issuer_event[tool_use_id]
+    if tool_use_id in links.group:
+        out["parallel_group_id"] = links.group[tool_use_id]
+    return out
+
+
+def _result_links(links: _CausalLinks, tool_use_id: Optional[str]) -> dict[str, Any]:
+    """``capture_event`` kwargs for a ``tool_result``: parent on its own
+    ``tool_call`` (matched by ``tool_use_id``, not arrival order) and join the same
+    parallel group. Pops the call mapping — a tool_use_id yields exactly one result.
+    Returns ``{}`` (→ ambient parent) when the call wasn't recorded (race)."""
+    out: dict[str, Any] = {}
+    if not tool_use_id:
+        return out
+    parent = links.call_event.pop(tool_use_id, None)
+    if parent is not None:
+        out["parent_event_id"] = parent
+    if tool_use_id in links.group:
+        out["parallel_group_id"] = links.group[tool_use_id]
+    return out
+
+
 def build_hooks(
     agent_identity: str, conversation_id: Optional[str] = None
 ) -> dict[str, list[Any]]:
@@ -259,12 +343,19 @@ def build_hooks(
             return {}
         try:
             run = route(input_data)
+            links = _registry.links_for(run)
+            tuid = tool_use_id or input_data.get("tool_use_id")
             with _bound(run):
-                capture_event(
+                event_id = capture_event(
                     kind="tool_call",
                     name=input_data.get("tool_name", "unknown"),
                     payload=input_data.get("tool_input"),
+                    **_call_links(links, tuid),
                 )
+            # Remember this call's event_id so its tool_result can parent on it
+            # (matched by the SDK's own tool_use_id, not by arrival order).
+            if tuid and event_id:
+                links.call_event[tuid] = event_id
         except Exception:  # an observer must never break the agent loop
             pass
         return {}
@@ -274,12 +365,15 @@ def build_hooks(
             return {}
         try:
             run = route(input_data)
+            links = _registry.links_for(run)
+            tuid = tool_use_id or input_data.get("tool_use_id")
             with _bound(run):
                 capture_event(
                     kind="tool_result",
                     name=input_data.get("tool_name", "unknown"),
                     payload=input_data.get("tool_response"),
                     action_extra={"outcome": "success"},
+                    **_result_links(links, tuid),
                 )
         except Exception:
             pass
@@ -290,12 +384,15 @@ def build_hooks(
             return {}
         try:
             run = route(input_data)
+            links = _registry.links_for(run)
+            tuid = tool_use_id or input_data.get("tool_use_id")
             with _bound(run):
                 capture_event(
                     kind="tool_result",
                     name=input_data.get("tool_name", "unknown"),
                     payload={"error": input_data.get("error")},
                     action_extra={"outcome": "failure"},
+                    **_result_links(links, tuid),
                 )
         except Exception:
             pass
@@ -512,13 +609,43 @@ def _maybe_capture_llm(run: Run, message: Any) -> None:
             model_ref["input_tokens"] = usage["input_tokens"]
         if "output_tokens" in usage:
             model_ref["output_tokens"] = usage["output_tokens"]
+    content = getattr(message, "content", None)
     with _bound(run):
-        capture_event(
+        llm_event_id = capture_event(
             kind="llm_call",
             name="messages.create",
             model_ref=model_ref,
-            payload={"content": _stringify_content(getattr(message, "content", None))},
+            payload={"content": _stringify_content(content)},
         )
+    _register_tool_issuers(run, content, llm_event_id)
+
+
+def _register_tool_issuers(run: Run, content: Any, llm_event_id: str) -> None:
+    """Record, from an AssistantMessage's ``ToolUseBlock``s, the causal links the
+    tool hooks consume: each ``tool_use_id`` → this ``llm_call`` (its parent), and —
+    when one message carries >1 tool_use block (the API's own statement that the
+    calls are concurrent) — a shared ``parallel_group_id``.
+
+    Best-effort grouping: the CLI may stream a turn's tool_use blocks as separate
+    AssistantMessages (each its own llm_call), in which case they share a
+    ``message_id`` but are not grouped here — only co-resident blocks are. Parenting
+    is unaffected and remains correct in both cases. (Regrouping streamed siblings
+    by ``message_id`` is a future flusher-side step.)"""
+    if not llm_event_id or not isinstance(content, list):
+        return
+    tool_use_ids = [
+        block.id
+        for block in content
+        if type(block).__name__ == "ToolUseBlock" and getattr(block, "id", None)
+    ]
+    if not tool_use_ids:
+        return
+    links = _registry.links_for(run)
+    group_id = generate_parallel_group_id() if len(tool_use_ids) > 1 else None
+    for tuid in tool_use_ids:
+        links.issuer_event[tuid] = llm_event_id
+        if group_id is not None:
+            links.group[tuid] = group_id
 
 
 def _stringify_content(content: Any) -> Any:
