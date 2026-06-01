@@ -18,7 +18,7 @@ def test_backpressure_flushes_on_soft_cap(fake_ingest: FakeIngest) -> None:
         start_flusher=False,
         buffer_soft_cap=2,
     )
-    with runfile_ai.run(agent_identity=AGENT):  # run_create append already hits cap=2
+    with runfile_ai.run(agent_identity=AGENT):  # run_create item + event hit cap=2 → backpressure flush
         runfile_ai.capture_event(kind="tool_call", name="a")
         runfile_ai.capture_event(kind="tool_call", name="b")
     runfile_ai.flush()
@@ -38,9 +38,9 @@ def test_nonblocking_drops_whole_run_with_diagnostic() -> None:
         buffer_soft_cap=3,
         capture_blocking=False,
     )
-    run_obj = runfile_ai.start_run(agent_identity=AGENT)  # item 1: run_create
-    runfile_ai.capture_event(kind="tool_call", name="a")  # item 2
-    runfile_ai.capture_event(kind="tool_call", name="b")  # item 3 -> hits cap -> drop run
+    run_obj = runfile_ai.start_run(agent_identity=AGENT)  # items 1-2: run_create item + event
+    runfile_ai.capture_event(kind="tool_call", name="a")  # item 3 -> hits cap=3 -> drop run
+    runfile_ai.capture_event(kind="tool_call", name="b")  # run already dropped -> silent no-op
     assert run_obj.dropped is True
 
     snap = inst.buffer.snapshot()

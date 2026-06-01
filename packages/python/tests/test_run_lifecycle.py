@@ -10,8 +10,19 @@ from runfile_ai.buffer import BufferedEvent, BufferedRunItem, EventBuffer
 AGENT = "did:web:bank.com:agents:loan-triage:v2"
 
 
-def _events(buffer: EventBuffer) -> list[dict]:
+# Witness-authored lifecycle: run_create / run_end are now real chain EVENTS, not
+# just items. These activity-focused helpers exclude the two boundary kinds so the
+# assertions about captured *activity* stay meaningful; the genesis behaviour has
+# its own dedicated test (test_run_create_is_witness_authored_genesis).
+_LIFECYCLE_BOUNDARY = {"run_create", "run_end"}
+
+
+def _all_events(buffer: EventBuffer) -> list[dict]:
     return [b.event for b in buffer.snapshot() if isinstance(b, BufferedEvent)]
+
+
+def _events(buffer: EventBuffer) -> list[dict]:
+    return [e for e in _all_events(buffer) if e["action"]["kind"] not in _LIFECYCLE_BOUNDARY]
 
 
 def _run_items(buffer: EventBuffer) -> list[dict]:
@@ -56,12 +67,30 @@ def test_local_seq_and_parent_chaining(sdk) -> None:
         runfile_ai.capture_event(kind="tool_result", name="c")
 
     events = _events(sdk.buffer)
-    assert [e["local_seq"] for e in events] == [0, 1, 2]
+    # local_seq 0 belongs to the witness-authored run_create genesis, so the first
+    # real event is seq 1; activity events stay contiguous from there.
+    assert [e["local_seq"] for e in events] == [1, 2, 3]
     assert [e["segment_index"] for e in events] == [0, 0, 0]
-    # parent threads to the previous event; first event's parent is None
+    # parent threads to the previous event; first real event's parent is None
     assert events[0]["parent_event_id"] is None
     assert events[1]["parent_event_id"] == events[0]["event_id"]
     assert events[2]["parent_event_id"] == events[1]["event_id"]
+
+
+def test_run_create_is_witness_authored_genesis(sdk) -> None:
+    """The SDK authors run_create/run_end as real chain events (not bare items)."""
+    with runfile_ai.run(agent_identity=AGENT):
+        runfile_ai.capture_event(kind="llm_call", name="a")
+
+    events = _all_events(sdk.buffer)
+    # the event chain opens with a run_create EVENT at seq 0 and closes with run_end
+    assert events[0]["action"]["kind"] == "run_create"
+    assert events[0]["local_seq"] == 0
+    assert events[0]["segment_index"] == 0
+    assert events[0]["parent_event_id"] is None
+    assert events[-1]["action"]["kind"] == "run_end"
+    # the companion run_create / run_end ITEMS still ride along for runs-row materialisation
+    assert [i["type"] for i in _run_items(sdk.buffer)] == ["run_create", "run_end"]
 
 
 def test_default_actor_is_the_run_agent(sdk) -> None:

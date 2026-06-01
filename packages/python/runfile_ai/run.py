@@ -185,6 +185,39 @@ def _emit_event(
     return event_id
 
 
+def _emit_lifecycle_event(
+    run: Run, *, kind: str, name: str, parent_event_id: Any = None
+) -> str:
+    """Author a run-boundary event (``run_create`` / ``run_end``) as a real chain link.
+
+    Per the witness-authored-lifecycle decision the SDK — the real witness — owns
+    every link in the chain, *including* the run boundaries, rather than shipping a
+    bare metadata item the server then synthesises an event from. The flusher chains
+    this exactly like any other ``BufferedEvent``: the ``run_create`` event, being
+    the first for a brand-new conversation, takes the zero sentinel as its
+    ``prev_event_hash`` (the genesis) and its hash seeds the first real event; there
+    is no longer any expected first-event ``chain_break``.
+
+    Unlike :func:`_emit_event` this does NOT touch ambient context: ``parent_event_id``
+    is passed explicitly (default ``None``) so it is used verbatim and does not
+    advance the ambient parent spine — the chain link is ``prev_event_hash`` (set by
+    the flusher), not the causal parent. This keeps the "WITHOUT touching ambient
+    context" contract of :func:`create_run` / :func:`emit_run_end` that adapters rely on.
+    """
+    inst = _require_instance()
+    if run.dropped or inst.disabled:
+        return ""
+    event_id, event = _build_event(
+        run,
+        kind=kind,
+        name=name,
+        parent_event_id=parent_event_id,
+        parallel_group_id=None,  # a run boundary is never part of a parallel group
+    )
+    _buffer_append(run, BufferedEvent(event=event, raw_payload=None, run=run))
+    return event_id
+
+
 def _buffer_append(run: Run, item: Any) -> None:
     """Append to the buffer and apply the overflow policy.
 
@@ -200,7 +233,7 @@ def _buffer_append(run: Run, item: Any) -> None:
     buffered = len(inst.buffer)
     if buffered >= inst.buffer.soft_cap:
         if inst.capture_blocking:
-            inst.flush()
+            inst.flush(force_all=True)  # overflow: drain everything, watermark be damned
         else:
             _drop_run_overflow(inst, run)
     elif buffered >= inst.buffer.flush_threshold:
@@ -277,7 +310,12 @@ def create_run(
     if labels:
         run_body["labels"] = labels
 
+    # The companion run_create ITEM survives only to materialise the runs row (it
+    # carries conversation_id / continued_from / labels the chain event has no slot
+    # for). The run_create EVENT below is the actual genesis chain link — authored
+    # by the witness, not synthesised by the server.
     _buffer_append(run, BufferedRunItem(item={"type": "run_create", "run": run_body}, run=run))
+    _emit_lifecycle_event(run, kind="run_create", name="run_create")
     return run
 
 
@@ -320,7 +358,11 @@ def emit_run_end(
     }
     if final_event_id is not None:
         item["final_event_id"] = final_event_id
+    # Companion item (above) closes the runs row; the run_end EVENT (below) is the
+    # run's final chain link. Parent it on final_event_id when known — purely
+    # causal; the chain link is prev_event_hash, set by the flusher.
     _buffer_append(run, BufferedRunItem(item=item, run=run))
+    _emit_lifecycle_event(run, kind="run_end", name="run_end", parent_event_id=final_event_id)
     run.lifecycle_state = "ended"
 
 

@@ -158,6 +158,16 @@ def _active() -> bool:
     return inst is not None and not inst.disabled
 
 
+def _buffer() -> Any:
+    """The active SDK buffer, or ``None`` when the SDK isn't initialised.
+
+    The adapter drives turn-atomic flushing through it (arm + advance watermark) so
+    a model turn's events stay whole across the flusher's 2s cadence.
+    """
+    inst = get_instance()
+    return inst.buffer if inst is not None else None
+
+
 # --------------------------------------------------------------------------- #
 # Run registry (keyed by framework cursor, not ambient context)
 # --------------------------------------------------------------------------- #
@@ -520,6 +530,9 @@ def build_hooks(
             child = _registry.pop_subagent(session_id, agent_id)
             if child is not None:
                 emit_run_end(child, outcome="success")
+                buf = _buffer()
+                if buf is not None:
+                    buf.advance_flush_watermark()  # release the child's final turn + run_end
         except Exception:
             pass
         return {}
@@ -710,6 +723,15 @@ def _emit_pending_turn(run: Run, links: _CausalLinks) -> None:
         return
     links.pending = None
     links.emitted_message_id = turn.message_id
+    # Turn-atomic flushing: the PREVIOUS turn is now complete — all its events
+    # (incl. tools interleaved as call a / result a / call b under one message_id —
+    # see turn-atomic-flushing.md) are buffered — so release it. This turn's
+    # llm_call and the tools that follow become the new held-open turn, kept whole
+    # in one drain so the flusher can group its concurrent fan-out.
+    buf = _buffer()
+    if buf is not None:
+        buf.arm_turn_atomic()
+        buf.advance_flush_watermark()
     extra: dict[str, Any] = {}
     if turn.otel is not None:
         extra["otel_attributes"] = turn.otel
@@ -866,3 +888,6 @@ async def observe_query(
             ended = _registry.pop_session(sid)
             if ended is not None:
                 emit_run_end(ended, outcome=outcome)
+                buf = _buffer()
+                if buf is not None:
+                    buf.advance_flush_watermark()  # release the final turn + run_end

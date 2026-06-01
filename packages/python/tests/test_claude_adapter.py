@@ -18,9 +18,12 @@ from typing import Any, Iterator
 import pytest
 from runfile_schemas.ingest import EventItem, RunCreateItem, RunEndItem, RunUpdateItem
 
+import runfile_ai
 from runfile_ai._hashing import ZERO_SENTINEL
 from runfile_ai.buffer import BufferedEvent, BufferedRunItem, EventBuffer
 from runfile_ai.integrations import anthropic as rf_anthropic
+from tests.conftest import VALID_TEST_KEY
+from tests.fake_ingest import FakeIngest
 
 AGENT = "did:web:bank.com:agents:research-assistant:v1"
 
@@ -125,8 +128,18 @@ def fake_claude(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
 # --------------------------------------------------------------------------- #
 
 
+# run_create / run_end are now witness-authored chain EVENTS (not just items); these
+# adapter assertions are about captured *activity*, so exclude the two boundary kinds.
+# (The new lifecycle events are still schema-validated via _assert_all_wire_valid.)
+_LIFECYCLE_BOUNDARY = {"run_create", "run_end"}
+
+
 def _events(buf: EventBuffer) -> list[dict]:
-    return [b.event for b in buf.snapshot() if isinstance(b, BufferedEvent)]
+    return [
+        b.event
+        for b in buf.snapshot()
+        if isinstance(b, BufferedEvent) and b.event["action"]["kind"] not in _LIFECYCLE_BOUNDARY
+    ]
 
 
 def _run_items(buf: EventBuffer) -> list[dict]:
@@ -185,7 +198,9 @@ async def test_pre_and_post_tool_use_chain(sdk, fake_claude) -> None:
     assert events[1]["action"]["outcome"] == "success"
     assert events[0]["parent_event_id"] is None
     assert events[1]["parent_event_id"] == events[0]["event_id"]  # parent continuity across hooks
-    assert events[1]["local_seq"] == 1
+    # seq 0 is the run_create genesis, so the first tool_call is seq 1 and its result seq 2
+    assert events[0]["local_seq"] == 1
+    assert events[1]["local_seq"] == 2
     _assert_all_wire_valid(sdk.buffer)
 
 
@@ -676,3 +691,95 @@ async def test_observe_query_passthrough_without_init(fake_claude) -> None:
     fake_claude.query = fake_query
     seen = [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
     assert len(seen) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Turn-atomic flushing (end-to-end through the real flusher + fake Ingest)
+# --------------------------------------------------------------------------- #
+
+
+def _shipped_events(server: FakeIngest, kind: str) -> list[dict]:
+    return [
+        it["event"]
+        for r in server.requests
+        if r.path == "/v1/batches"
+        for it in r.body["items"]
+        if it["type"] == "event" and it["event"]["action"]["kind"] == kind
+    ]
+
+
+async def test_open_turn_held_across_flush_then_grouped(fake_ingest: FakeIngest, fake_claude) -> None:
+    """A multi-tool turn split by a mid-turn flush still groups (the live regression).
+
+    Models the real Claude stream shape (raw-stream.jsonl): ONE message_id issues
+    two tools, streamed as call a / result a / call b / result b. With a flush fired
+    mid-turn, today's per-drain grouping would ship call a alone and leave the pair
+    ungrouped. Turn-atomic flushing holds the whole open turn, so both tool_calls
+    drain together and the flusher assigns them one parallel_group_id.
+    """
+    runfile_ai.init(api_key=VALID_TEST_KEY, base_url=fake_ingest.base_url, start_flusher=False)
+
+    async def fake_query(*, prompt, options=None, **kw):
+        pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
+        post = (options.hooks or {})["PostToolUse"][0].hooks[0]
+        # one turn (m1), two tools interleaved with their results — same message_id
+        yield AssistantMessage(content=[ToolUseBlock(id="t1", name="a")], model="claude-opus-4-8", session_id="s1", message_id="m1")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="a", tool_input={"q": 1}, tool_use_id="t1"), "t1", None)
+        runfile_ai.flush()  # <-- mid-turn drain: the watermark must hold the open turn
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="a", tool_response={"ok": 1}, tool_use_id="t1"), "t1", None)
+        yield AssistantMessage(content=[ToolUseBlock(id="t2", name="b")], model="claude-opus-4-8", session_id="s1", message_id="m1")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="b", tool_input={"q": 2}, tool_use_id="t2"), "t2", None)
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="b", tool_response={"ok": 2}, tool_use_id="t2"), "t2", None)
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+    runfile_ai.flush()  # final drain (run ended → watermark released)
+
+    # the mid-turn flush shipped the genesis prefix but NOT the open turn
+    posts = [r for r in fake_ingest.requests if r.path == "/v1/batches"]
+    assert len(posts) >= 2  # at least: mid-turn genesis batch + post-run turn batch
+
+    tool_calls = _shipped_events(fake_ingest, "tool_call")
+    assert [e["action"]["name"] for e in tool_calls] == ["a", "b"]  # both shipped
+    groups = {e.get("parallel_group_id") for e in tool_calls}
+    assert len(groups) == 1 and None not in groups  # one group — the split did NOT ungroup them
+    # the tool_results inherit the same group
+    results = _shipped_events(fake_ingest, "tool_result")
+    assert {e.get("parallel_group_id") for e in results} == groups
+
+
+async def test_held_turn_preserves_hash_chain_across_the_split(fake_ingest: FakeIngest, fake_claude) -> None:
+    """Holding a turn must not perturb the chain: a mid-turn flush splits the run
+    across batches, and the events still link by prev_event_hash across them."""
+    from runfile_ai._hashing import compute_event_hash
+
+    runfile_ai.init(api_key=VALID_TEST_KEY, base_url=fake_ingest.base_url, start_flusher=False)
+
+    async def fake_query(*, prompt, options=None, **kw):
+        pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
+        post = (options.hooks or {})["PostToolUse"][0].hooks[0]
+        yield AssistantMessage(content=[ToolUseBlock(id="t1", name="a")], model="claude-opus-4-8", session_id="s1", message_id="m1")
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="a", tool_input={}, tool_use_id="t1"), "t1", None)
+        runfile_ai.flush()  # split here
+        await post(_base_input("s1", hook_event_name="PostToolUse", tool_name="a", tool_response={}, tool_use_id="t1"), "t1", None)
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+    runfile_ai.flush()
+
+    # reconstruct every shipped event in ship order and verify the prev-hash links
+    events = [
+        it["event"]
+        for r in fake_ingest.requests
+        if r.path == "/v1/batches"
+        for it in r.body["items"]
+        if it["type"] == "event"
+    ]
+    assert events[0]["action"]["kind"] == "run_create"
+    assert events[0]["prev_event_hash_intent"] == ZERO_SENTINEL
+    prev = ZERO_SENTINEL
+    for e in events:
+        assert e["prev_event_hash_intent"] == prev  # links unbroken across the split
+        prev = compute_event_hash({**e, "prev_event_hash": prev})

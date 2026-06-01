@@ -48,8 +48,12 @@ def test_end_to_end_batch_shipped(fake_ingest: FakeIngest) -> None:
     assert len(posts) == 1
     body = posts[0]
 
-    # item order preserved, run_create synthesised from the lifecycle item
-    assert [it["type"] for it in body["items"]] == ["run_create", "event", "event", "run_end"]
+    # item order preserved. The SDK (the witness) authors run_create / run_end as
+    # real chain EVENTS; the companion run_create / run_end ITEMS ride along to
+    # materialise / close the runs row.
+    assert [it["type"] for it in body["items"]] == [
+        "run_create", "event", "event", "event", "run_end", "event",
+    ]
 
     # headers
     headers = next(r.headers for r in fake_ingest.requests if r.path == "/v1/batches")
@@ -59,44 +63,56 @@ def test_end_to_end_batch_shipped(fake_ingest: FakeIngest) -> None:
     assert headers["idempotency-key"]
 
     events = [it["event"] for it in body["items"] if it["type"] == "event"]
-    # required-nullable field survived the dump (not dropped as None)
+    assert [e["action"]["kind"] for e in events] == [
+        "run_create", "llm_call", "tool_call", "run_end",
+    ]
+
+    # the genesis is the witness-authored run_create event: parent None (required-
+    # nullable field survives the dump as null), prev = the zero sentinel. The first
+    # real event chains to ITS hash — no benign first-event chain_break any more.
     assert "parent_event_id" in events[0]
     assert events[0]["parent_event_id"] is None
-
-    # the hash chain links: event0 starts at the zero sentinel; event1's intent
-    # equals the SDK's hash of event0 (over the exact dumped bytes).
     assert events[0]["prev_event_hash_intent"] == ZERO_SENTINEL
-    h0 = compute_event_hash({**events[0], "prev_event_hash": ZERO_SENTINEL})
-    assert events[1]["prev_event_hash_intent"] == h0
+    h_genesis = compute_event_hash({**events[0], "prev_event_hash": ZERO_SENTINEL})
+    assert events[1]["prev_event_hash_intent"] == h_genesis
 
     # the ciphertext is real: decrypts with the cached data key to the original.
-    payload_ref = events[0]["payload_ref"]
+    payload_ref = events[1]["payload_ref"]  # events[1] is the llm_call carrying the payload
     ciphertext = base64.b64decode(payload_ref["ciphertext_base64"])
     nonce = base64.b64decode(payload_ref["encryption"]["nonce"])
     key = inst.datakeys._entries[("self", AGENT)].key.plaintext
     cleartext = AESGCM(bytes(key)).decrypt(nonce, ciphertext, None)
     assert json.loads(cleartext) == {"prompt": "summarise the loan application"}
     assert payload_ref["sha256"] == "sha256:" + hashlib.sha256(ciphertext).hexdigest()
-    # the non-payload event carries no payload_ref
-    assert "payload_ref" not in events[1]
+    # the non-payload events (run_create genesis, tool_call, run_end) carry no payload_ref
+    assert "payload_ref" not in events[0]
+    assert "payload_ref" not in events[2]
 
 
 def test_chain_continues_across_flushes(fake_ingest: FakeIngest) -> None:
     _init(fake_ingest)
     with runfile_ai.run(agent_identity=AGENT):
         runfile_ai.capture_event(kind="tool_call", name="a")
-        runfile_ai.flush()  # batch 1: run_create + event0
+        runfile_ai.flush()  # batch 1: run_create item + run_create event + tool_call a
         runfile_ai.capture_event(kind="tool_call", name="b")
-        runfile_ai.flush()  # batch 2: event1
-    runfile_ai.flush()  # batch 3: run_end
+        runfile_ai.flush()  # batch 2: tool_call b
+    runfile_ai.flush()  # batch 3: run_end item + run_end event
 
     posts = _batch_posts(fake_ingest)
     assert len(posts) == 3
-    event0 = next(it["event"] for it in posts[0]["items"] if it["type"] == "event")
-    event1 = next(it["event"] for it in posts[1]["items"] if it["type"] == "event")
-    # chain state persisted across drains
-    h0 = compute_event_hash({**event0, "prev_event_hash": ZERO_SENTINEL})
-    assert event1["prev_event_hash_intent"] == h0
+
+    def _event(post: dict, kind: str) -> dict:
+        return next(
+            it["event"] for it in post["items"]
+            if it["type"] == "event" and it["event"]["action"]["kind"] == kind
+        )
+
+    a = _event(posts[0], "tool_call")  # batch 1 also carries the run_create genesis event
+    b = _event(posts[1], "tool_call")
+    # chain state persisted across drains: b chains to the SDK's hash of a, even
+    # though a shipped in an earlier batch (a's own prev is the genesis hash).
+    h_a = compute_event_hash({**a, "prev_event_hash": a["prev_event_hash_intent"]})
+    assert b["prev_event_hash_intent"] == h_a
 
 
 def test_retry_reuses_idempotency_key(fake_ingest: FakeIngest) -> None:
@@ -162,8 +178,9 @@ def test_batch_size_cap_splits_batches(fake_ingest: FakeIngest) -> None:
     assert len(posts) >= 2  # split by the byte cap, not the 100-item cap
     for body in posts:
         assert len(json.dumps(body).encode("utf-8")) <= inst._flusher.max_batch_bytes
-    # all 6 items delivered (run_create + 4 events + run_end), none dropped
-    assert sum(len(b["items"]) for b in posts) == 6
+    # all 8 items delivered (run_create item + run_create event + 4 events +
+    # run_end item + run_end event), none dropped
+    assert sum(len(b["items"]) for b in posts) == 8
 
 
 def test_item_count_cap_splits_batches(fake_ingest: FakeIngest) -> None:
@@ -176,7 +193,8 @@ def test_item_count_cap_splits_batches(fake_ingest: FakeIngest) -> None:
 
     posts = _batch_posts(fake_ingest)
     assert all(len(b["items"]) <= 3 for b in posts)
-    assert sum(len(b["items"]) for b in posts) == 9  # run_create + 7 events + run_end
+    # run_create item + run_create event + 7 events + run_end item + run_end event
+    assert sum(len(b["items"]) for b in posts) == 11
 
 
 def test_datakey_unreachable_defers_not_drops(fake_ingest: FakeIngest) -> None:
@@ -232,7 +250,9 @@ def test_size_trigger_drains_before_interval(fake_ingest: FakeIngest) -> None:
     inst._flusher.start()
 
     with runfile_ai.run(agent_identity=AGENT):
-        for i in range(3):  # run_create + 3 events >= threshold → size trigger
+        # run_create item + run_create event already put 2 in the buffer; the first
+        # tool_call crosses flush_threshold=3 → size trigger wakes the flusher.
+        for i in range(3):
             runfile_ai.capture_event(kind="tool_call", name=f"t{i}")
         deadline = time.monotonic() + 3.0
         while fake_ingest.batch_count == 0 and time.monotonic() < deadline:
