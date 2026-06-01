@@ -1,6 +1,6 @@
 {
   "name": "@runfile-ai/sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Runfile SDK — tamper-evident audit capture for AI agents (LangGraph.js, Claude Agent SDK, Mastra, Vercel AI SDK, MCP).",
   "license": "Apache-2.0",
