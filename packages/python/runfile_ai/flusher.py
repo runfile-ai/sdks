@@ -39,7 +39,7 @@ from runfile_schemas.ingest import (
 
 from ._constants import SCHEMA_VERSION, SDK_NAME, sdk_version
 from ._hashing import ZERO_SENTINEL, compute_event_hash
-from ._ids import generate_batch_id
+from ._ids import generate_batch_id, generate_parallel_group_id
 from .buffer import BufferedEvent, BufferedItem, BufferedRunItem
 from .classifier import CLASSIFIER_VERSION
 from .datakey import DataKeyError
@@ -171,6 +171,7 @@ class Flusher:
             items = self.client.buffer.take_all()
             if not items:
                 return result
+            _assign_parallel_groups(items)
             wire_items: list[dict[str, Any]] = []
             for idx, item in enumerate(items):
                 try:
@@ -408,6 +409,62 @@ class Flusher:
 
 class _ShipError(RuntimeError):
     pass
+
+
+def _assign_parallel_groups(items: list[BufferedItem]) -> None:
+    """Tag concurrently-dispatched tool calls with a shared ``parallel_group_id``.
+
+    Concurrency is read structurally, not guessed: within a run, a maximal run of
+    **≥2 consecutive ``tool_call`` events that share an issuing ``llm_call`` with no
+    ``tool_result`` between them** was dispatched in parallel — a *sequential* call
+    only ever happens after its predecessor's result, so two calls back-to-back
+    must be concurrent. The adapter can't assign this at capture time (the first
+    call is already buffered before the second arrives); the flusher can, because
+    it sees the drained events together. Each grouped call's matching
+    ``tool_result`` (linked via ``parent_event_id``) inherits the same group.
+
+    Sound by construction (never groups sequential calls, never fabricates a
+    group). Only limitation: a parallel batch split across two drains isn't
+    grouped — the earlier calls already shipped — which degrades to "ungrouped"
+    (honest), never to a wrong group. Mutates event dicts in place before hashing,
+    so the group id is part of the committed ``event_hash``. Events already carrying
+    a ``parallel_group_id`` (e.g. set by the adapter) are left untouched.
+    """
+    pending: dict[str, list[dict[str, Any]]] = {}  # run_id -> open consecutive tool_calls
+    call_group: dict[str, str] = {}  # tool_call event_id -> assigned group_id
+
+    def close(run_id: str) -> None:
+        batch = pending.get(run_id)
+        if batch and len(batch) >= 2:
+            group_id = generate_parallel_group_id()
+            for ev in batch:
+                ev["parallel_group_id"] = group_id
+                call_group[ev["event_id"]] = group_id
+        pending[run_id] = []
+
+    for item in items:
+        if not isinstance(item, BufferedEvent):
+            continue  # run_create/update/end don't participate
+        event = item.event
+        run_id = event.get("run_id", "")
+        kind = event.get("action", {}).get("kind")
+        if kind == "tool_call":
+            if "parallel_group_id" in event:
+                continue  # already grouped (adapter co-resident path) — leave it
+            batch = pending.setdefault(run_id, [])
+            # A different issuer means a new turn → the prior batch is closed.
+            if batch and event.get("parent_event_id") != batch[0].get("parent_event_id"):
+                close(run_id)
+            pending.setdefault(run_id, []).append(event)
+        elif kind == "tool_result":
+            close(run_id)  # results close the open call batch (and assign groups)
+            group_id = call_group.get(event.get("parent_event_id") or "")
+            if group_id is not None and "parallel_group_id" not in event:
+                event["parallel_group_id"] = group_id
+        else:
+            close(run_id)  # llm_call / lifecycle / other ends a concurrent batch
+    for run_id in list(pending):
+        close(run_id)
 
 
 def _serialize(payload: Any) -> tuple[bytes, str]:
