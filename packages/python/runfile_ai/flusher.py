@@ -527,9 +527,9 @@ def _assign_parallel_groups(items: list[BufferedItem]) -> None:
             continue
         if "parallel_group_id" in event:
             continue
-        group_id = call_group.get(event.get("parent_event_id") or "")
-        if group_id is not None:
-            event["parallel_group_id"] = group_id
+        inherited = call_group.get(event.get("parent_event_id") or "")
+        if inherited is not None:
+            event["parallel_group_id"] = inherited
 
 
 def _serialize(payload: Any) -> tuple[bytes, str]:
