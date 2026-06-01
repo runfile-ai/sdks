@@ -413,7 +413,10 @@ async def test_tool_result_parents_on_its_own_tool_call_under_interleave(sdk, fa
     [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
 
     events = _events(sdk.buffer)
-    by = lambda kind, name: next(e for e in events if e["action"]["kind"] == kind and e["action"]["name"] == name)
+
+    def by(kind, name):
+        return next(e for e in events if e["action"]["kind"] == kind and e["action"]["name"] == name)
+
     llm1, llm2 = [e for e in events if e["action"]["kind"] == "llm_call"][:2]
     call_t1, call_t2 = by("tool_call", "policy"), by("tool_call", "bureau")
     res_t1, res_t2 = by("tool_result", "policy"), by("tool_result", "bureau")
