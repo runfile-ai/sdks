@@ -519,6 +519,34 @@ async def test_streamed_turn_coalesces_to_one_llm_call(sdk, fake_claude) -> None
     _assert_all_wire_valid(sdk.buffer)
 
 
+async def test_llm_usage_counts_cached_input_tokens(sdk, fake_claude) -> None:
+    """With prompt caching, raw input_tokens is only the non-cached delta (often a
+    handful). model_ref.input_tokens must reflect the TRUE input the model
+    processed (uncached + cache-read + cache-creation), with the split preserved in
+    otel_attributes — otherwise the audit reports an absurd prompt size like 2."""
+
+    async def fake_query(*, prompt, options=None, **kw):
+        yield AssistantMessage(
+            content=[_TextBlock("ok")], model="claude-opus-4-8", session_id="s1", message_id="m1",
+            usage={"input_tokens": 2, "output_tokens": 38,
+                   "cache_read_input_tokens": 9000, "cache_creation_input_tokens": 1200},
+        )
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+
+    llm = next(e for e in _events(sdk.buffer) if e["action"]["kind"] == "llm_call")
+    assert llm["model_ref"]["input_tokens"] == 2 + 9000 + 1200  # true context, not 2
+    assert llm["model_ref"]["output_tokens"] == 38
+    extra = llm["otel_attributes"]["extra"]
+    assert extra["uncached_input_tokens"] == 2
+    assert extra["cache_read_input_tokens"] == 9000
+    assert extra["cache_creation_input_tokens"] == 1200
+    assert llm["otel_attributes"]["gen_ai_usage_input_tokens"] == 10202
+    _assert_all_wire_valid(sdk.buffer)
+
+
 async def test_observe_query_passthrough_without_init(fake_claude) -> None:
     # SDK not initialised → transparent pass-through, nothing captured, no crash.
     async def fake_query(*, prompt, options=None, **kw):

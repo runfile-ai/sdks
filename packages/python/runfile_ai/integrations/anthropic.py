@@ -633,14 +633,11 @@ def _maybe_capture_llm(run: Run, message: Any) -> None:
         _register_tool_issuers(run, content, links.current_llm_event_id)
         return
 
-    usage = getattr(message, "usage", None) or {}
-    model_ref: dict[str, Any] = {"provider": "anthropic", "model_id": model_id}
-    if isinstance(usage, dict):
-        if "input_tokens" in usage:
-            model_ref["input_tokens"] = usage["input_tokens"]
-        if "output_tokens" in usage:
-            model_ref["output_tokens"] = usage["output_tokens"]
+    usage_fields, otel_usage = _model_usage(getattr(message, "usage", None))
+    model_ref: dict[str, Any] = {"provider": "anthropic", "model_id": model_id, **usage_fields}
     extra: dict[str, Any] = {}
+    if otel_usage is not None:
+        extra["otel_attributes"] = otel_usage
     if message_id is not None:
         # Stamp the turn id so the call can be cross-referenced / regrouped.
         extra["labels"] = {"claude_message_id": message_id}
@@ -682,6 +679,54 @@ def _register_tool_issuers(run: Run, content: Any, llm_event_id: Optional[str]) 
         links.issuer_event[tuid] = llm_event_id
         if group_id is not None:
             links.group[tuid] = group_id
+
+
+def _model_usage(usage: Any) -> tuple[dict[str, int], Optional[dict[str, Any]]]:
+    """Map an Anthropic ``usage`` dict to ``(model_ref token fields, otel_attributes)``.
+
+    With prompt caching the bare ``input_tokens`` is only the *non-cached* delta —
+    typically a handful of tokens — which badly understates the prompt the model
+    actually processed (the bulk arrives as ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``). So ``model_ref.input_tokens`` is the TRUE
+    input — uncached + cache-read + cache-creation — and the cached/uncached
+    breakdown is preserved in ``otel_attributes.extra`` for cost analysis.
+    """
+    if not isinstance(usage, dict):
+        return {}, None
+
+    def _int(key: str) -> int:
+        value = usage.get(key)
+        return value if isinstance(value, int) else 0
+
+    uncached = _int("input_tokens")
+    cache_read = _int("cache_read_input_tokens")
+    cache_creation = _int("cache_creation_input_tokens")
+    output = _int("output_tokens")
+    total_input = uncached + cache_read + cache_creation
+
+    fields: dict[str, int] = {}
+    if total_input:
+        fields["input_tokens"] = total_input
+    if output or "output_tokens" in usage:
+        fields["output_tokens"] = output
+    if not fields:
+        return {}, None
+
+    otel: dict[str, Any] = {
+        "gen_ai_usage_input_tokens": total_input,
+        "gen_ai_usage_output_tokens": output,
+    }
+    breakdown: dict[str, Any] = {}
+    if cache_read or cache_creation:
+        # Only worth recording the split when caching actually occurred.
+        breakdown["uncached_input_tokens"] = uncached
+        if cache_read:
+            breakdown["cache_read_input_tokens"] = cache_read
+        if cache_creation:
+            breakdown["cache_creation_input_tokens"] = cache_creation
+    if breakdown:
+        otel["extra"] = breakdown
+    return fields, otel
 
 
 def _stringify_content(content: Any) -> Any:
