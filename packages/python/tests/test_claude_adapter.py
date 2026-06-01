@@ -483,6 +483,42 @@ async def test_single_tool_call_has_no_parallel_group(sdk, fake_claude) -> None:
     _assert_all_wire_valid(sdk.buffer)
 
 
+async def test_streamed_turn_coalesces_to_one_llm_call(sdk, fake_claude) -> None:
+    """The CLI streams one model turn as several AssistantMessages sharing a
+    message_id (thinking, text, tool-use). They must collapse into ONE llm_call —
+    not one per block — usage counted once, and a tool call in a later block still
+    parents on that single llm_call."""
+
+    def msg(content, mid, usage):
+        return AssistantMessage(content=content, model="claude-opus-4-8", session_id="s1", message_id=mid, usage=usage)
+
+    async def fake_query(*, prompt, options=None, **kw):
+        pre = (options.hooks or {})["PreToolUse"][0].hooks[0]
+        u1 = {"input_tokens": 143, "output_tokens": 54}
+        # one model turn (m1) streamed as three blocks, same usage repeated
+        yield msg([_TextBlock("<thinking>")], "m1", u1)
+        yield msg([_TextBlock("I'll call a tool")], "m1", u1)
+        yield msg([ToolUseBlock(id="t1", name="a")], "m1", u1)
+        await pre(_base_input("s1", hook_event_name="PreToolUse", tool_name="a", tool_input={}, tool_use_id="t1"), "t1", None)
+        # a second, distinct turn (m2)
+        yield msg([_TextBlock("done")], "m2", {"input_tokens": 5, "output_tokens": 2})
+        yield ResultMessage(session_id="s1")
+
+    fake_claude.query = fake_query
+    [m async for m in rf_anthropic.observe_query(prompt="hi", agent_identity=AGENT)]
+
+    events = _events(sdk.buffer)
+    llm = [e for e in events if e["action"]["kind"] == "llm_call"]
+    assert len(llm) == 2  # one per turn (m1, m2), NOT one per block (would be 4)
+    # usage counted once per turn, not repeated across the turn's blocks
+    assert sum(e["model_ref"].get("input_tokens", 0) for e in llm) == 148  # 143 + 5
+    assert llm[0]["labels"]["claude_message_id"] == "m1"
+    # the tool call (a later block of m1) parents on the single m1 llm_call
+    tc = next(e for e in events if e["action"]["kind"] == "tool_call")
+    assert tc["parent_event_id"] == llm[0]["event_id"]
+    _assert_all_wire_valid(sdk.buffer)
+
+
 async def test_observe_query_passthrough_without_init(fake_claude) -> None:
     # SDK not initialised → transparent pass-through, nothing captured, no crash.
     async def fake_query(*, prompt, options=None, **kw):

@@ -33,7 +33,11 @@ Translation:
   ``elicitation_response`` → ``run_resume``
 - ``SubagentStart`` → ``delegate`` on the parent + a child run with ``delegated_from``;
   ``SubagentStop`` → end the child run
-- ``AssistantMessage`` (seen by :func:`observe_query`) → ``llm_call`` with ``model_ref``
+- ``AssistantMessage`` (seen by :func:`observe_query`) → ``llm_call`` with ``model_ref``.
+  The CLI streams one model turn as several ``AssistantMessage``s (Thinking / text /
+  ToolUse) sharing a ``message_id``; these are coalesced into ONE ``llm_call`` per
+  turn (tagged with ``labels.claude_message_id``) so the trail records real model
+  calls, not stream fragments.
 
 **Causal parenting (the event DAG, not a linear chain).** ``parent_event_id`` is the
 OTel-aligned causal primitive, distinct from ``local_seq`` (the ordering ordinal).
@@ -178,6 +182,12 @@ class _CausalLinks:
     issuer_event: dict[str, str] = field(default_factory=dict)
     #: tool_use_id → parallel_group_id (only when its assistant turn issued >1 tool)
     group: dict[str, str] = field(default_factory=dict)
+    #: The model turn currently being assembled. The CLI streams one turn's
+    #: Thinking/text/ToolUse blocks as separate AssistantMessages sharing a
+    #: ``message_id``; we emit ONE ``llm_call`` per ``message_id`` and fold later
+    #: blocks of that turn into it (so 8 turns aren't recorded as ~21 calls).
+    current_message_id: str | None = None
+    current_llm_event_id: str | None = None
 
 
 class _Registry:
@@ -595,13 +605,34 @@ def _session_id_of(message: Any) -> Optional[str]:
 
 
 def _maybe_capture_llm(run: Run, message: Any) -> None:
-    """Emit an ``llm_call`` for an AssistantMessage (the model-call evidence hooks
-    don't provide)."""
+    """Emit an ``llm_call`` for a model turn (the model-call evidence hooks don't
+    provide), coalescing the CLI's streamed blocks into one event per turn.
+
+    The CLI streams one model turn as several ``AssistantMessage``s — a
+    ThinkingBlock, a text block, a ToolUseBlock — each sharing the turn's
+    ``message_id``. Emitting one ``llm_call`` per message would record ~21 calls
+    for ~8 real turns (and repeat the turn's usage on each). So we emit ONE
+    ``llm_call`` on the first block of a ``message_id`` and fold later blocks of the
+    same turn into it: no new event, but their tool calls still link to the turn's
+    ``llm_call``. Emitting on the *first* block (not at turn end) is required so the
+    ``llm_call`` precedes the tool hooks that parent on it. Turns without a
+    ``message_id`` fall back to one ``llm_call`` per message.
+    """
     if type(message).__name__ != "AssistantMessage":
         return
     model_id = getattr(message, "model", None)
     if not model_id:
         return
+    content = getattr(message, "content", None)
+    message_id = getattr(message, "message_id", None)
+    links = _registry.links_for(run)
+
+    # Continuation of the turn already recorded: don't emit a second llm_call —
+    # just link any tool calls in this block to the turn's existing llm_call.
+    if message_id is not None and message_id == links.current_message_id:
+        _register_tool_issuers(run, content, links.current_llm_event_id)
+        return
+
     usage = getattr(message, "usage", None) or {}
     model_ref: dict[str, Any] = {"provider": "anthropic", "model_id": model_id}
     if isinstance(usage, dict):
@@ -609,28 +640,33 @@ def _maybe_capture_llm(run: Run, message: Any) -> None:
             model_ref["input_tokens"] = usage["input_tokens"]
         if "output_tokens" in usage:
             model_ref["output_tokens"] = usage["output_tokens"]
-    content = getattr(message, "content", None)
+    extra: dict[str, Any] = {}
+    if message_id is not None:
+        # Stamp the turn id so the call can be cross-referenced / regrouped.
+        extra["labels"] = {"claude_message_id": message_id}
     with _bound(run):
         llm_event_id = capture_event(
             kind="llm_call",
             name="messages.create",
             model_ref=model_ref,
             payload={"content": _stringify_content(content)},
+            **extra,
         )
+    links.current_message_id = message_id
+    links.current_llm_event_id = llm_event_id
     _register_tool_issuers(run, content, llm_event_id)
 
 
-def _register_tool_issuers(run: Run, content: Any, llm_event_id: str) -> None:
+def _register_tool_issuers(run: Run, content: Any, llm_event_id: Optional[str]) -> None:
     """Record, from an AssistantMessage's ``ToolUseBlock``s, the causal links the
-    tool hooks consume: each ``tool_use_id`` → this ``llm_call`` (its parent), and —
-    when one message carries >1 tool_use block (the API's own statement that the
-    calls are concurrent) — a shared ``parallel_group_id``.
+    tool hooks consume: each ``tool_use_id`` → its turn's ``llm_call`` (the parent),
+    and — when one message carries >1 tool_use block (the API's own statement that
+    the calls are concurrent) — a shared ``parallel_group_id``.
 
-    Best-effort grouping: the CLI may stream a turn's tool_use blocks as separate
-    AssistantMessages (each its own llm_call), in which case they share a
-    ``message_id`` but are not grouped here — only co-resident blocks are. Parenting
-    is unaffected and remains correct in both cases. (Regrouping streamed siblings
-    by ``message_id`` is a future flusher-side step.)"""
+    Best-effort grouping: a turn whose tool_use blocks the CLI streams as separate
+    same-``message_id`` messages parents them all on the one ``llm_call`` but does
+    not group them (only co-resident blocks are grouped). Parenting is correct in
+    both cases."""
     if not llm_event_id or not isinstance(content, list):
         return
     tool_use_ids = [
