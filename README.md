@@ -37,6 +37,13 @@ translates framework-native signals into Runfile runs and events:
 The full design lives in the private design docs (`sdk-design.md`,
 `sdk-ingest-api.md`, `event-schema.md`).
 
+The Claude Agent SDK and LangGraph Python adapters are exercised end to end by a
+**credit-line decision agent** — the same human-in-the-loop agent built on
+multiple runtimes, capturing a tamper-evident audit trail from the PyPI-published
+`runfile-ai` (via the `runfile-ai[anthropic]` / `runfile-ai[langgraph]` extras,
+never a path dependency). Capture is opt-in: a transparent pass-through unless
+`RUNFILE_API_KEY` is set.
+
 ## Layout
 
 ```
