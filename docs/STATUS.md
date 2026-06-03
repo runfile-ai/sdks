@@ -1,8 +1,9 @@
 # SDK build status
 
-Scaffold of `runfile/sdks` — the open-source SDK repo. The shell (package
-manifests, module skeletons, CI, release wiring) is in place; SDK logic is
-filled in package by package.
+`runfile/sdks` — the open-source SDK repo. The **Python SDK (`runfile-ai`) is
+live on PyPI (`0.2.0`)**: core capture API plus the Claude Agent SDK and LangGraph
+adapters. The TypeScript SDK and the Verifier CLI are still being filled in
+package by package.
 
 ## Naming (decided)
 
@@ -27,7 +28,7 @@ regenerate, and redeploy the Ingest / Event-Processor validators first.)
 
 | Package | Scaffold | Core logic | Adapters |
 |---------|:--------:|:----------:|----------|
-| `runfile-ai` (Python) | ✅ | ✅ (manual API end-to-end) | ⏳ LangGraph, OpenAI Agents, Claude SDK, MCP (v1) |
+| `runfile-ai` (Python) | ✅ | ✅ (manual API end-to-end) | ✅ Claude SDK, ✅ LangGraph · ⏳ OpenAI Agents, MCP |
 | `@runfile-ai/sdk` (TS) | ✅ | ⏳ | ⏳ LangGraph.js, Claude SDK (v1); OpenAI/Mastra/Vercel (v1.5) |
 | `runfile-verifier` (Go) | ✅ | ⏳ | n/a |
 
@@ -44,12 +45,26 @@ regenerate, and redeploy the Ingest / Event-Processor validators first.)
   + redaction (drop/hash/pass_through; Luhn for cards).
 - Never drops an individual event (chain integrity); never writes plaintext to disk.
 
+## Framework adapters — Claude Agent SDK + LangGraph DONE (shipped in `0.2.0`)
+
+- **Claude Agent SDK** (`integrations/anthropic.py`) — `observe_query()` wraps the
+  SDK `query()`: whole-turn assembly (one `llm_call`/turn), reasoning capture, true
+  input tokens under prompt caching, parallel tool-call grouping, witness-authored
+  lifecycle events.
+- **LangGraph** (`integrations/langgraph.py`) — `instrument()` registers a handler
+  subclassing `GraphCallbackHandler`: node enter/exit, `llm_call`, tool call/result,
+  `__interrupt__` → `run_suspend`, resume stitching, subgraph `delegate`.
+
+Both are exercised end to end by the credit-line decision agent example (same agent,
+multiple runtimes), installed from PyPI via the `runfile-ai[anthropic]` /
+`runfile-ai[langgraph]` extras.
+
 ## Remaining Python work
 
-1. **Vault tokenization** — `tokenize`/`tokenize_with_fallback` currently drop;
+1. **OpenAI Agents + MCP adapters** — `integrations/openai_agents.py` and
+   `integrations/mcp.py` are still skeletons (`instrument()` signatures only).
+2. **Vault tokenization** — `tokenize`/`tokenize_with_fallback` currently drop;
    wire the Vault `/v1/tokenize` client (needs the Vault request/response contract).
-2. **Framework adapters** — LangGraph first (v1 priority), then OpenAI Agents,
-   Claude Agent SDK, MCP. The customer-facing surface.
 3. Decorators (`capture_decision`), telemetry/logging.
 
-Then: TypeScript core (mirror), Verifier CLI logic, end-to-end examples.
+Then: TypeScript core (mirror), Verifier CLI logic.
