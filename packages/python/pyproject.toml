@@ -23,7 +23,11 @@ Documentation = "https://docs.runfile.ai"
 Source = "https://github.com/runfile-ai/sdks"
 
 [project.optional-dependencies]
-langgraph = ["langgraph>=0.2"]
+# >=1.0: first release with langgraph.callbacks.GraphCallbackHandler (the sync
+# handler exposing on_interrupt / on_resume the adapter relies on for HITL capture).
+# On older langgraph the adapter still loads (falls back to the plain LangChain
+# BaseCallbackHandler) but can't observe graph interrupt / resume.
+langgraph = ["langgraph>=1.0"]
 openai-agents = ["openai-agents>=0.1"]
 # >=0.1.29: first release with the Notification, SubagentStart, and
 # PermissionRequest hook events (PostToolUseFailure landed in 0.1.26). Older
@@ -35,6 +39,9 @@ dev = [
   "pytest-asyncio>=0.23",
   "mypy>=1.10",
   "ruff>=0.5",
+  # The LangGraph adapter tests drive a real graph; without this the suite
+  # importorskips them. langchain-core comes transitively.
+  "langgraph>=1.0",
 ]
 
 [tool.hatch.build.targets.wheel]
