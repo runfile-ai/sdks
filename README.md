@@ -58,9 +58,12 @@ sdks/
 
 ## Status
 
-🚧 **Scaffold.** This is the repository shell — package manifests, module
-skeletons, CI, and release wiring are in place; the SDK logic is being filled in
-package by package. See [`docs/STATUS.md`](docs/STATUS.md).
+🐍 **Python (`runfile-ai`) is live on PyPI — `0.2.0`.** The core (manual +
+context-manager capture API, encryption, hash-chained flusher, PII redaction) and
+the **Claude Agent SDK** and **LangGraph** framework adapters are shipped and
+exercised end to end by the [credit-line decision agent](#what-the-sdk-does)
+example. The OpenAI Agents and MCP adapters, the TypeScript core, and the Verifier
+CLI logic are still in progress. See [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Development
 
