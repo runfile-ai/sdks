@@ -37,12 +37,13 @@ translates framework-native signals into Runfile runs and events:
 The full design lives in the private design docs (`sdk-design.md`,
 `sdk-ingest-api.md`, `event-schema.md`).
 
-The Claude Agent SDK and LangGraph Python adapters are exercised end to end by a
-**credit-line decision agent** — the same human-in-the-loop agent built on
-multiple runtimes, capturing a tamper-evident audit trail from the PyPI-published
-`runfile-ai` (via the `runfile-ai[anthropic]` / `runfile-ai[langgraph]` extras,
-never a path dependency). Capture is opt-in: a transparent pass-through unless
-`RUNFILE_API_KEY` is set.
+The Claude Agent SDK, LangGraph, and OpenAI Agents Python adapters are exercised
+end to end by a **credit-line decision agent** — the same human-in-the-loop agent
+built on multiple runtimes, capturing a tamper-evident audit trail from the
+PyPI-published `runfile-ai` (via the `runfile-ai[anthropic]` /
+`runfile-ai[langgraph]` / `runfile-ai[openai-agents]` extras, never a path
+dependency). Capture is opt-in: a transparent pass-through unless `RUNFILE_API_KEY`
+is set.
 
 ## Layout
 
@@ -58,12 +59,12 @@ sdks/
 
 ## Status
 
-🐍 **Python (`runfile-ai`) is live on PyPI — `0.2.0`.** The core (manual +
+🐍 **Python (`runfile-ai`) is live on PyPI — `0.3.0`.** The core (manual +
 context-manager capture API, encryption, hash-chained flusher, PII redaction) and
-the **Claude Agent SDK** and **LangGraph** framework adapters are shipped and
-exercised end to end by the [credit-line decision agent](#what-the-sdk-does)
-example. The OpenAI Agents and MCP adapters, the TypeScript core, and the Verifier
-CLI logic are still in progress. See [`docs/STATUS.md`](docs/STATUS.md).
+the **Claude Agent SDK**, **LangGraph**, and **OpenAI Agents** framework adapters
+are shipped and exercised end to end by the [credit-line decision
+agent](#what-the-sdk-does) example. The MCP adapter, the TypeScript core, and the
+Verifier CLI logic are still in progress. See [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Development
 

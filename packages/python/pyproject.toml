@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "runfile-ai"
-version = "0.2.0"
+version = "0.3.0"
 description = "Runfile SDK — tamper-evident audit capture for AI agents (LangGraph, OpenAI Agents, Claude Agent SDK, MCP)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,6 +42,9 @@ dev = [
   # The LangGraph adapter tests drive a real graph; without this the suite
   # importorskips them. langchain-core comes transitively.
   "langgraph>=1.0",
+  # The OpenAI Agents adapter tests drive a real Runner with a scripted model;
+  # without this the suite importorskips them. openai comes transitively.
+  "openai-agents>=0.1",
 ]
 
 [tool.hatch.build.targets.wheel]

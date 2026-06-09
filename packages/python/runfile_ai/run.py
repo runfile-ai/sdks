@@ -107,10 +107,14 @@ def _build_event(
     actor: Optional[dict[str, Any]] = None,
     parent_event_id: Any = _UNSET,
     parallel_group_id: Any = _UNSET,
+    event_id: Optional[str] = None,
     **extra: Any,
 ) -> tuple[str, dict[str, Any]]:
     inst = _require_instance()
-    event_id = generate_event_id()
+    # event_id may be supplied so a caller can reference an event before it is emitted
+    # (e.g. an adapter that creates a delegated child run whose delegated_from points at
+    # a delegate event emitted later, in correct order). Otherwise a fresh ULID.
+    event_id = event_id or generate_event_id()
     # An explicit parent_event_id (incl. None) wins over the ambient parent; the
     # sentinel means "fall back to the ambient linear thread" (manual API, llm_call).
     parent = parent_event_id if parent_event_id is not _UNSET else current_parent_event()
@@ -153,6 +157,7 @@ def _emit_event(
     actor: Optional[dict[str, Any]] = None,
     parent_event_id: Any = _UNSET,
     parallel_group_id: Any = _UNSET,
+    event_id: Optional[str] = None,
     **extra: Any,
 ) -> str:
     """Construct one event's metadata, stash its cleartext payload, buffer it.
@@ -177,6 +182,7 @@ def _emit_event(
         actor=actor,
         parent_event_id=parent_event_id,
         parallel_group_id=parallel_group_id,
+        event_id=event_id,
         **extra,
     )
     _buffer_append(run, BufferedEvent(event=event, raw_payload=payload, run=run))
@@ -486,6 +492,7 @@ def capture_event(*, kind: str, name: str, payload: Any = None, **fields: Any) -
     actor = fields.pop("actor", None)
     parent_event_id = fields.pop("parent_event_id", _UNSET)
     parallel_group_id = fields.pop("parallel_group_id", _UNSET)
+    event_id = fields.pop("event_id", None)
     return _emit_event(
         run,
         kind=kind,
@@ -494,6 +501,7 @@ def capture_event(*, kind: str, name: str, payload: Any = None, **fields: Any) -
         actor=actor,
         parent_event_id=parent_event_id,
         parallel_group_id=parallel_group_id,
+        event_id=event_id,
         **fields,
     )
 

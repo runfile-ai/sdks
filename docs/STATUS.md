@@ -1,9 +1,10 @@
 # SDK build status
 
 `runfile/sdks` — the open-source SDK repo. The **Python SDK (`runfile-ai`) is
-live on PyPI (`0.2.0`)**: core capture API plus the Claude Agent SDK and LangGraph
-adapters. The TypeScript SDK and the Verifier CLI are still being filled in
-package by package.
+live on PyPI** (core capture API plus the Claude Agent SDK and LangGraph adapters at
+`0.2.0`); **`0.3.0` adds the OpenAI Agents SDK adapter** (tracing-processor based, with
+HITL tool-approval suspend/resume). The TypeScript SDK and the Verifier CLI are still
+being filled in package by package.
 
 ## Naming (decided)
 
@@ -28,7 +29,7 @@ regenerate, and redeploy the Ingest / Event-Processor validators first.)
 
 | Package | Scaffold | Core logic | Adapters |
 |---------|:--------:|:----------:|----------|
-| `runfile-ai` (Python) | ✅ | ✅ (manual API end-to-end) | ✅ Claude SDK, ✅ LangGraph · ⏳ OpenAI Agents, MCP |
+| `runfile-ai` (Python) | ✅ | ✅ (manual API end-to-end) | ✅ Claude SDK, ✅ LangGraph, ✅ OpenAI Agents · ⏳ MCP |
 | `@runfile-ai/sdk` (TS) | ✅ | ⏳ | ⏳ LangGraph.js, Claude SDK (v1); OpenAI/Mastra/Vercel (v1.5) |
 | `runfile-verifier` (Go) | ✅ | ⏳ | n/a |
 
@@ -45,7 +46,7 @@ regenerate, and redeploy the Ingest / Event-Processor validators first.)
   + redaction (drop/hash/pass_through; Luhn for cards).
 - Never drops an individual event (chain integrity); never writes plaintext to disk.
 
-## Framework adapters — Claude Agent SDK + LangGraph DONE (shipped in `0.2.0`)
+## Framework adapters — Claude Agent SDK + LangGraph (`0.2.0`) + OpenAI Agents (`0.3.0`) DONE
 
 - **Claude Agent SDK** (`integrations/anthropic.py`) — `observe_query()` wraps the
   SDK `query()`: whole-turn assembly (one `llm_call`/turn), reasoning capture, true
@@ -54,15 +55,26 @@ regenerate, and redeploy the Ingest / Event-Processor validators first.)
 - **LangGraph** (`integrations/langgraph.py`) — `instrument()` registers a handler
   subclassing `GraphCallbackHandler`: node enter/exit, `llm_call`, tool call/result,
   `__interrupt__` → `run_suspend`, resume stitching, subgraph `delegate`.
+- **OpenAI Agents** (`integrations/openai_agents.py`) — `instrument()` registers a
+  **tracing `TracingProcessor`** (the canonical observability surface — hooks lack tool
+  call-ids/args, so they can't chain parallel tools); `instrument_runner()` adds a thin
+  `Runner.run` wrapper for HITL. Maps the verified span tree (`AgentSpanData`→run,
+  `TurnSpanData`→`llm_call`, `FunctionSpanData`→`tool_call`/`tool_result`,
+  `HandoffSpanData`→`handoff`+new run); parallel tools (siblings of a turn) →
+  `parallel_group`; tool-approval `result.interruptions` → `run_suspend` /
+  `tool_approval_requested`, `RunState`-resume → `run_resume` + `tool_approval_granted` /
+  `tool_approval_denied` (decision read from the resumed `RunState`). Design +
+  empirically-verified span tree in `private/v3/openai-agents-adapter-design.md`.
 
-Both are exercised end to end by the credit-line decision agent example (same agent,
+All three are exercised end to end by the credit-line decision agent example (same agent,
 multiple runtimes), installed from PyPI via the `runfile-ai[anthropic]` /
-`runfile-ai[langgraph]` extras.
+`runfile-ai[langgraph]` / `runfile-ai[openai-agents]` extras.
 
 ## Remaining Python work
 
-1. **OpenAI Agents + MCP adapters** — `integrations/openai_agents.py` and
-   `integrations/mcp.py` are still skeletons (`instrument()` signatures only).
+1. **MCP adapter** — `integrations/mcp.py` is still a skeleton (`instrument()`
+   signature only). OpenAI Agents follow-ups: `as_tool` delegation, streaming-path
+   lifecycle bracketing, and `Generation`/`Response`-span model-id enrichment.
 2. **Vault tokenization** — `tokenize`/`tokenize_with_fallback` currently drop;
    wire the Vault `/v1/tokenize` client (needs the Vault request/response contract).
 3. Decorators (`capture_decision`), telemetry/logging.
