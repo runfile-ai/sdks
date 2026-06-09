@@ -229,6 +229,8 @@ async def test_notification_permission_prompt_suspends(sdk, fake_claude) -> None
     assert susp[0]["suspension_details"]["reason"] == "awaiting_human_approval"
     assert susp[0]["suspension_details"]["detection_source"] == "framework_inferred"
     assert susp[0]["suspension_details"]["framework_signal"]["framework"] == "claude_agent_sdk"
+    # session_id is captured as the durable resume handle for cross-process join.
+    assert susp[0]["suspension_details"]["correlation_token"] == "s1"
     upd = [i for i in _run_items(sdk.buffer) if i["type"] == "run_update"]
     assert upd[0]["lifecycle_state"] == "awaiting_human"
     assert upd[0]["triggered_by_event_id"] == susp[0]["event_id"]
@@ -243,6 +245,7 @@ async def test_notification_idle_and_resume(sdk, fake_claude) -> None:
     assert "run_suspend" in kinds and "run_resume" in kinds
     resume = [e for e in _events(sdk.buffer) if e["action"]["kind"] == "run_resume"][0]
     assert resume["segment_index"] == 1 and resume["local_seq"] == 0  # resume opens a new segment
+    assert resume["resume_details"]["correlation_token"] == "s1"  # mirrors the suspend
     _assert_all_wire_valid(sdk.buffer)
 
 

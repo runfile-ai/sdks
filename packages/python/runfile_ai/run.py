@@ -389,6 +389,7 @@ def suspend_run(
     expected_resume_by: Optional[str] = None,
     detection_source: str = "customer_explicit",
     framework_signal: Optional[dict[str, Any]] = None,
+    correlation_token: Optional[str] = None,
 ) -> str:
     """Emit a ``run_suspend`` event + a ``run_update`` flipping to ``awaiting_*``.
 
@@ -397,6 +398,11 @@ def suspend_run(
     The manual API defaults ``detection_source="customer_explicit"``; framework
     adapters pass ``"framework_inferred"`` plus the ``framework_signal`` they
     observed (so auditors can verify the suspension was grounded in a real signal).
+
+    ``correlation_token`` is the framework's own durable resume handle (LangGraph
+    ``thread_id``, Claude ``session_id``, OpenAI ``trace_id``). Capturing it here
+    lets a later resume — or an out-of-process human-approval witnessed elsewhere —
+    be joined back to this suspension. It is a correlation key, not a credential.
     """
     run = _require_run()
     details: dict[str, Any] = {"reason": reason, "detection_source": detection_source}
@@ -406,6 +412,8 @@ def suspend_run(
         details["expected_resume_by"] = expected_resume_by
     if framework_signal is not None:
         details["framework_signal"] = framework_signal
+    if correlation_token is not None:
+        details["correlation_token"] = correlation_token
 
     event_id = _emit_event(run, kind="run_suspend", name=name or reason, suspension_details=details)
     state = _AWAITING_STATE.get(reason, "awaiting_human")
@@ -430,8 +438,14 @@ def resume_run(
     triggered_by: str,
     run_id: Optional[str] = None,
     resumer_principal: Optional[str] = None,
+    correlation_token: Optional[str] = None,
 ) -> str:
-    """Emit a ``run_resume`` event (new segment) + a ``run_update`` back to ``active``."""
+    """Emit a ``run_resume`` event (new segment) + a ``run_update`` back to ``active``.
+
+    ``correlation_token`` should mirror the matching ``suspend_run`` so the
+    suspend/resume pair (and any out-of-process human-approval keyed on the same
+    handle) can be stitched together downstream.
+    """
     run = _require_run()
     if run_id is not None and run_id != run.run_id:
         raise ValueError(f"resume_run: active run is {run.run_id}, not {run_id}")
@@ -439,6 +453,8 @@ def resume_run(
     details: dict[str, Any] = {"triggered_by": triggered_by}
     if resumer_principal is not None:
         details["resumer_principal"] = resumer_principal
+    if correlation_token is not None:
+        details["correlation_token"] = correlation_token
 
     event_id = _emit_event(run, kind="run_resume", name="resume", resume_details=details)
     _buffer_append(
