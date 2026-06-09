@@ -796,7 +796,7 @@ class _WrappedRunner:
             # grant/deny sits correctly ahead of the (loose) tool execution in the segment.
             decisions = _approval_decisions(input)
             with _bound(st.active_run, st):
-                resume_run(triggered_by="human_approval_granted")
+                resume_run(triggered_by="human_approval_granted", correlation_token=tid)
                 for inter in prior:
                     cid = getattr(inter, "call_id", None)
                     granted = decisions.get(cid, True) if isinstance(cid, str) else True
@@ -816,7 +816,7 @@ class _WrappedRunner:
         run = after.active_run
         interruptions = list(getattr(result, "interruptions", None) or [])
         if run is not None and interruptions:
-            self._suspend(run, after, interruptions)
+            self._suspend(run, after, interruptions, tid)
         elif run is not None:
             emit_run_end(run, outcome="success")
             _registry.drop(tid)
@@ -836,7 +836,9 @@ class _WrappedRunner:
         """
         return self._runner.run_streamed(agent, input, **kwargs)
 
-    def _suspend(self, run: Run, st: _TraceState, interruptions: list[Any]) -> None:
+    def _suspend(
+        self, run: Run, st: _TraceState, interruptions: list[Any], correlation_token: Optional[str] = None
+    ) -> None:
         with _bound(run, st):
             for it in interruptions:
                 capture_event(
@@ -852,6 +854,7 @@ class _WrappedRunner:
                     "framework": _FRAMEWORK,
                     "signal_name": "result.interruptions",
                 },
+                correlation_token=correlation_token,
             )
         st.suspended = True
         st.pending_interruptions = list(interruptions)

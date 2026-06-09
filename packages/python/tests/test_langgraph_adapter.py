@@ -285,6 +285,9 @@ async def test_interrupt_then_resume_is_one_run_two_segments(sdk) -> None:
     assert susp["suspension_details"]["reason"] == "awaiting_human_input"
     assert susp["suspension_details"]["detection_source"] == "framework_inferred"
     assert susp["suspension_details"]["framework_signal"]["framework"] == "langgraph"
+    # The LangGraph thread_id is captured as the durable resume handle so an
+    # out-of-process resume/approval can be joined back to this suspension.
+    assert susp["suspension_details"]["correlation_token"] == "T1"
     assert items[1]["triggered_by_event_id"] == susp["event_id"]
 
     # Resume on the SAME thread_id → same run, new segment, no duplicate run.
@@ -297,6 +300,9 @@ async def test_interrupt_then_resume_is_one_run_two_segments(sdk) -> None:
     assert states == ["awaiting_human", "active"]
     resume = [e for e in _events(sdk.buffer) if e["action"]["kind"] == "run_resume"][0]
     assert resume["segment_index"] == 1 and resume["local_seq"] == 0  # new segment
+    # The resume mirrors the suspend's correlation_token (same thread_id) so the
+    # suspend/resume pair stitches together.
+    assert resume["resume_details"]["correlation_token"] == "T1"
 
     # The interrupt (a suspension) is NOT recorded as a tool failure.
     assert not any(

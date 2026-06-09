@@ -373,6 +373,11 @@ def test_hitl_suspend_then_approve_is_one_run_two_segments(sdk: Any) -> None:
     # the suspend carries a framework signal grounded in the real interruption
     suspend = next(e for e in _events(buf) if e["action"]["kind"] == "run_suspend")
     assert suspend["suspension_details"]["framework_signal"]["signal_name"] == "result.interruptions"
+    # trace_id is the resume handle (it lives in the serialized RunState), captured on
+    # both suspend and resume so the pair stitches together; same token across the pair.
+    resume = next(e for e in _events(buf) if e["action"]["kind"] == "run_resume")
+    token = suspend["suspension_details"]["correlation_token"]
+    assert token and resume["resume_details"]["correlation_token"] == token
     _assert_all_wire_valid(buf)
 
 

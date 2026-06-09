@@ -215,6 +215,7 @@ class _Registry:
         self._runs: dict[UUID, Run] = {}  # root run_id → Run
         self._root_of: dict[UUID, UUID] = {}  # any run_id → its root run_id
         self._thread_root: dict[str, UUID] = {}  # thread_id → current root run_id
+        self._run_thread: dict[str, str] = {}  # Runfile run_id → thread_id (resume handle)
         self._suspended: set[str] = set()  # Runfile run_ids currently suspended
         self._links: dict[str, _CausalLinks] = {}  # Runfile run_id → scratch
 
@@ -283,7 +284,13 @@ class _Registry:
             self._root_of[root] = root
             if thread_id is not None:
                 self._thread_root[thread_id] = root
+                self._run_thread[run.run_id] = thread_id
         return run, False
+
+    def thread_for(self, run: Run) -> Optional[str]:
+        """The LangGraph ``thread_id`` (resume handle) this run was invoked under, if any."""
+        with self._lock:
+            return self._run_thread.get(run.run_id)
 
     def mark_suspended(self, run: Run) -> None:
         with self._lock:
@@ -305,6 +312,7 @@ class _Registry:
                 self._runs.pop(root, None)
             self._links.pop(run.run_id, None)
             self._suspended.discard(run.run_id)
+            self._run_thread.pop(run.run_id, None)
             for tid, r in list(self._thread_root.items()):
                 if r in roots:
                     del self._thread_root[tid]
@@ -707,6 +715,7 @@ def build_handler(agent_identity: str, conversation_id: Optional[str] = None) ->
                         name="__interrupt__",
                         detection_source="framework_inferred",
                         framework_signal=signal,
+                        correlation_token=_registry.thread_for(run),
                     )
                 _registry.mark_suspended(run)
                 buf = _buffer()
@@ -723,7 +732,10 @@ def build_handler(agent_identity: str, conversation_id: Optional[str] = None) ->
                 if run is None or not _registry.is_suspended(run):
                     return
                 with _bound(run):
-                    resume_run(triggered_by="human_input_received")
+                    resume_run(
+                        triggered_by="human_input_received",
+                        correlation_token=_registry.thread_for(run),
+                    )
                 _registry.mark_resumed(run)
             except Exception:
                 pass

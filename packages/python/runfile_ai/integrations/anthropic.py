@@ -465,6 +465,7 @@ def build_hooks(
             return {}
         try:
             ntype = input_data.get("notification_type", "")
+            session_id = input_data.get("session_id")
             run = route(input_data)
             signal = {
                 "framework": _FRAMEWORK,
@@ -478,9 +479,13 @@ def build_hooks(
                         name=ntype,
                         detection_source="framework_inferred",
                         framework_signal=signal,
+                        correlation_token=session_id,
                     )
                 elif ntype in _RESUME_NOTIFICATIONS:
-                    resume_run(triggered_by=_RESUME_NOTIFICATIONS[ntype])
+                    resume_run(
+                        triggered_by=_RESUME_NOTIFICATIONS[ntype],
+                        correlation_token=session_id,
+                    )
         except Exception:
             pass
         return {}
