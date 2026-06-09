@@ -69,7 +69,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
-from .._ids import generate_parallel_group_id, generate_run_id
+from .._ids import generate_event_id, generate_parallel_group_id, generate_run_id
 from ..client import get_instance
 from ..context import (
     current_parent_event,
@@ -187,13 +187,16 @@ def _derive_identity(root: str, agent_name: str) -> str:
 
 @dataclass
 class _FuncRecord:
-    """One function (tool) span's captured data, stashed on its ``on_span_end`` and
-    flushed when its parent turn ends."""
+    """One function span's captured data, stashed on its ``on_span_end`` and flushed when
+    its parent turn ends. Either a tool call (``name``/``input``/``output``) or — when the
+    function was an ``agent.as_tool()`` delegation — a ``delegate`` marker carrying the
+    pre-allocated delegate event id + the child run it spawned."""
 
     name: str
-    input: Any
-    output: Any
-    failed: bool
+    input: Any = None
+    output: Any = None
+    failed: bool = False
+    delegate: Optional[dict[str, str]] = None
 
 
 @dataclass
@@ -210,8 +213,19 @@ class _TraceState:
     span_run: dict[str, Run] = field(default_factory=dict)
     #: turn span_ids seen (so a function knows if its parent is a turn -> defer, else eager)
     turn_spans: set[str] = field(default_factory=set)
+    #: span_id -> SpanData type name (to walk ancestry for delegation detection)
+    span_kind: dict[str, str] = field(default_factory=dict)
+    #: span_id -> parent_id (to walk ancestry without the live span objects)
+    span_parent: dict[str, str] = field(default_factory=dict)
+    #: function span_ids that delegated (an agent.as_tool sub-agent ran inside) — their
+    #: tool_call/tool_result is suppressed; the delegate event represents them instead
+    delegation_funcs: set[str] = field(default_factory=set)
+    #: delegated agent span_id -> its child Run (ended when that agent span ends)
+    delegated_agent_runs: dict[str, Run] = field(default_factory=dict)
     #: turn span_id -> buffered function records for that turn (emitted at turn end)
     turn_funcs: dict[str, list[_FuncRecord]] = field(default_factory=dict)
+    #: turn span_id -> model id from a nested Generation/Response span (built-in models)
+    turn_model: dict[str, str] = field(default_factory=dict)
     #: the run currently accepting events (last opened agent run)
     active_run: Optional[Run] = None
     #: a handoff target run created at HandoffSpan end, awaiting its AgentSpan start
@@ -340,6 +354,9 @@ def build_processor(
             try:
                 st = _registry.get_or_create(span.trace_id)
                 kind = _span_type(span)
+                st.span_kind[span.span_id] = kind
+                if span.parent_id:
+                    st.span_parent[span.span_id] = span.parent_id
                 if kind == "AgentSpanData":
                     self._open_agent_run(st, span)
                 else:
@@ -364,10 +381,18 @@ def build_processor(
                     self._stash_function(st, span)
                 elif kind == "TurnSpanData":
                     self._emit_turn(st, span)
+                elif kind in ("GenerationSpanData", "ResponseSpanData"):
+                    self._record_model(st, span, kind)
                 elif kind == "HandoffSpanData":
                     self._emit_handoff(st, span)
                 elif kind == "GuardrailSpanData":
                     self._emit_guardrail(st, span)
+                elif kind == "AgentSpanData":
+                    # A delegated (as-tool) sub-agent's run ends when its agent span ends;
+                    # the root / handed-off run is closed by the wrapper or at trace end.
+                    child = st.delegated_agent_runs.pop(span.span_id, None)
+                    if child is not None:
+                        emit_run_end(child, outcome="success")
             except Exception:
                 pass
 
@@ -381,8 +406,27 @@ def build_processor(
 
         # ---- run boundaries --------------------------------------------- #
 
+        def _delegation_ancestor(self, st: _TraceState, span: Any) -> Optional[str]:
+            """The nearest FunctionSpanData ancestor of an agent span, if any — i.e. this
+            agent is running inside an ``agent.as_tool()`` call (a delegation). Returns the
+            function span_id, or None for a root / handoff-target agent (whose nearest
+            non-task ancestor is the Task, not a function)."""
+            pid: Optional[str] = span.parent_id
+            while pid:
+                kind = st.span_kind.get(pid)
+                if kind == "FunctionSpanData":
+                    return pid
+                if kind == "AgentSpanData":
+                    return None
+                pid = st.span_parent.get(pid)
+            return None
+
         def _open_agent_run(self, st: _TraceState, span: Any) -> None:
             name = _attr(span.span_data, "name") or "agent"
+            func_anc = self._delegation_ancestor(st, span)
+            if func_anc is not None:
+                self._open_delegated_run(st, span, func_anc, str(name))
+                return
             with st.lock:
                 if st.pending_handoff_run is not None:
                     # This agent span is the target of a just-emitted handoff.
@@ -403,9 +447,56 @@ def build_processor(
                 st.span_run[span.span_id] = run
                 st.active_run = run
 
+        def _open_delegated_run(
+            self, st: _TraceState, span: Any, func_anc: str, name: str
+        ) -> None:
+            """An ``agent.as_tool()`` sub-agent: create a child run delegated from the run
+            that owns the as-tool function, and queue a ``delegate`` event onto that
+            function's turn (emitted after the turn's llm_call, in order). The as-tool
+            function's own tool_call/tool_result is suppressed — the delegate represents it.
+            """
+            parent_run = st.span_run.get(func_anc)
+            outer_turn = st.span_parent.get(func_anc)
+            if parent_run is None or outer_turn is None:
+                return
+            child_identity = identity_map.get(name)
+            derived = child_identity is None
+            if child_identity is None:
+                child_identity = _derive_identity(parent_run.agent_identity, name)
+            delegate_eid = generate_event_id()
+            with st.lock:
+                child = create_run(
+                    agent_identity=child_identity,
+                    conversation_id=st.conversation_id,
+                    framework=_FRAMEWORK,
+                    delegated_from={"run_id": parent_run.run_id, "event_id": delegate_eid},
+                    labels=(
+                        {"openai_agent_name": name, "derived_identity": "true"}
+                        if derived
+                        else {"openai_agent_name": name}
+                    ),
+                )
+                st.turn_funcs.setdefault(outer_turn, []).append(
+                    _FuncRecord(
+                        name=name,
+                        delegate={
+                            "event_id": delegate_eid,
+                            "delegated_run_id": child.run_id,
+                            "delegated_agent_identity": child_identity,
+                        },
+                    )
+                )
+                st.delegation_funcs.add(func_anc)
+                st.span_run[span.span_id] = child
+                st.delegated_agent_runs[span.span_id] = child
+
         # ---- turn (llm_call) + its tools -------------------------------- #
 
         def _stash_function(self, st: _TraceState, span: Any) -> None:
+            if span.span_id in st.delegation_funcs:
+                # An agent.as_tool() call — the sub-agent ran in its own delegated run and
+                # a delegate event already represents it; don't also emit a tool_call.
+                return
             data = span.span_data
             output, approval_pending = _func_output(_attr(data, "output"))
             if approval_pending:
@@ -446,15 +537,34 @@ def build_processor(
                     parent_event_id=call_id,
                 )
 
+        def _record_model(self, st: _TraceState, span: Any, kind: str) -> None:
+            # A built-in OpenAI model nests a Generation/Response span (with the real
+            # model id) under the turn. Record it so the turn's llm_call reports the
+            # precise model rather than the configured/"unknown" fallback.
+            data = span.span_data
+            model_id: Optional[str] = None
+            if kind == "GenerationSpanData":
+                model_id = _attr(data, "model")
+            else:  # ResponseSpanData: the id lives on the response object
+                resp = _attr(data, "response")
+                model_id = getattr(resp, "model", None) if resp is not None else None
+            parent_id = span.parent_id or ""
+            if model_id and parent_id:
+                with st.lock:
+                    st.turn_model[parent_id] = str(model_id)
+
         def _emit_turn(self, st: _TraceState, span: Any) -> None:
             run = st.span_run.get(span.span_id)
             if run is None:
                 return
             data = span.span_data
-            model_id = model_map.get(str(_attr(data, "agent_name") or ""))
+            # Prefer the precise model id from a nested Generation/Response span, then the
+            # caller-supplied map, then "unknown" (custom models expose no model id).
+            model_id = st.turn_model.pop(span.span_id, None) or model_map.get(
+                str(_attr(data, "agent_name") or "")
+            )
             usage = _usage_dict(_attr(data, "usage"))
             funcs = st.turn_funcs.pop(span.span_id, [])
-            group_id = generate_parallel_group_id() if len(funcs) >= 2 else None
 
             with _bound(run, st):
                 llm_event_id = capture_event(
@@ -463,28 +573,47 @@ def build_processor(
                     model_ref=_model_ref(model_id, usage),
                     payload=None,
                 )
+                # A delegation (agent.as_tool) becomes a delegate event — emitted with the
+                # id its child run already references in delegated_from — parented on this
+                # turn's llm_call, in order after it.
+                tool_recs = [r for r in funcs if r.delegate is None]
+                for rec in funcs:
+                    if rec.delegate is not None:
+                        capture_event(
+                            kind="delegate",
+                            name=rec.name,
+                            event_id=rec.delegate["event_id"],
+                            parent_event_id=llm_event_id,
+                            delegation_details={
+                                "delegated_run_id": rec.delegate["delegated_run_id"],
+                                "delegated_agent_identity": rec.delegate["delegated_agent_identity"],
+                                "framework_signal": "openai_agents_as_tool",
+                            },
+                        )
                 # Emit all tool_calls then all tool_results (matches the schema's parallel
                 # rendering); a single tool degenerates to call->result. Each tool parents
-                # on this turn's llm_call; results parent on their own call.
+                # on this turn's llm_call; results parent on their own call. Grouping is
+                # over the tool calls only (delegations are not part of the fan-out group).
+                tool_group = generate_parallel_group_id() if len(tool_recs) >= 2 else None
                 call_events: list[Optional[str]] = []
-                for rec in funcs:
+                for rec in tool_recs:
                     call_events.append(
                         capture_event(
                             kind="tool_call",
                             name=rec.name,
                             payload=rec.input,
                             parent_event_id=llm_event_id,
-                            parallel_group_id=group_id,
+                            parallel_group_id=tool_group,
                         )
                     )
-                for rec, call_id in zip(funcs, call_events):
+                for rec, call_id in zip(tool_recs, call_events):
                     capture_event(
                         kind="tool_result",
                         name=rec.name,
                         payload=rec.output,
                         action_extra={"outcome": "failure" if rec.failed else "success"},
                         parent_event_id=call_id,
-                        parallel_group_id=group_id,
+                        parallel_group_id=tool_group,
                     )
 
         # ---- handoff ----------------------------------------------------- #
@@ -693,12 +822,18 @@ class _WrappedRunner:
             _registry.drop(tid)
         return result
 
-    # convenience: run_streamed shares the same lifecycle bracketing
     def run_streamed(self, agent: Any, input: Any, **kwargs: Any) -> Any:
-        # The streamed result is consumed by the caller; tracing still fires live, so the
-        # processor captures execution. Lifecycle bracketing for the streamed path is a
-        # documented follow-up (needs to await stream completion before inspecting
-        # interruptions). For now, delegate unwrapped.
+        """Streamed runs delegate to the underlying runner unwrapped.
+
+        The streamed result is consumed by the caller via ``stream_events()``, and the
+        SDK opens its own trace for the duration. Because the wrapper does NOT create that
+        trace, it is not ``lifecycle_managed`` — so the processor's *auto-lifecycle*
+        captures the full run (``run_create`` at the first agent span, ``run_end`` at
+        trace end) plus all execution. The only gap vs the non-streamed path is HITL
+        bracketing (``run_suspend`` / ``run_resume`` for a streamed tool-approval pause),
+        which needs the wrapper to await stream completion before inspecting
+        ``interruptions`` — a documented follow-up.
+        """
         return self._runner.run_streamed(agent, input, **kwargs)
 
     def _suspend(self, run: Run, st: _TraceState, interruptions: list[Any]) -> None:

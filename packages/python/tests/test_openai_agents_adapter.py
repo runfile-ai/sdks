@@ -286,6 +286,39 @@ def test_handoff_ends_source_and_opens_target_run(sdk: Any) -> None:
     _assert_all_wire_valid(buf)
 
 
+def test_model_id_enriched_from_generation_span(sdk: Any) -> None:
+    """A built-in model nests a Generation span (with the real model id) under the turn;
+    the llm_call should report it even with no agent_model_map."""
+    from agents import generation_span
+
+    class _GenModel(Model):
+        async def get_response(self, *a: Any, **k: Any) -> ModelResponse:
+            with generation_span(model="gpt-4o-2026", model_config={"temperature": 0}) as span:
+                span.span_data.usage = {"input_tokens": 11, "output_tokens": 3}
+                return ModelResponse(
+                    output=[_msg("done")],
+                    usage=Usage(requests=1, input_tokens=11, output_tokens=3, total_tokens=14),
+                    response_id="r",
+                )
+
+        async def stream_response(self, *a: Any, **k: Any) -> Any:
+            raise NotImplementedError
+
+        async def get_retry_advice(self, request: Any) -> Any:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    rf_oai.instrument(agent_identity=AGENT)  # deliberately NO agent_model_map
+    agent = Agent(name="A", instructions="x", model=_GenModel())
+    _run(agent)
+    buf = sdk.buffer
+    llm = next(e for e in _events(buf) if e["action"]["kind"] == "llm_call")
+    assert llm["model_ref"]["model_id"] == "gpt-4o-2026"
+    _assert_all_wire_valid(buf)
+
+
 # --------------------------------------------------------------------------- #
 # HITL (tool approval) via instrument_runner
 # --------------------------------------------------------------------------- #
@@ -368,6 +401,52 @@ def test_hitl_reject_records_denied_and_no_tool_result(sdk: Any) -> None:
     assert "tool_approval_denied" in kinds
     assert "tool_approval_granted" not in kinds
     # a rejected tool never executes → no successful tool_result for it
+    _assert_all_wire_valid(buf)
+
+
+def test_as_tool_delegation_creates_child_run(sdk: Any) -> None:
+    """agent.as_tool() runs the sub-agent in its own delegated run; the parent run gets a
+    `delegate` event (after the issuing llm_call), not a tool_call."""
+    rf_oai.instrument(
+        agent_identity=AGENT,
+        agent_identity_map={"Researcher": "did:web:bank.com:agents:researcher:v1"},
+    )
+    inner = Agent(
+        name="Researcher", instructions="x",
+        model=_ScriptedModel([[_msg("research done")]]),
+    )
+    outer = Agent(
+        name="Orchestrator", instructions="x",
+        tools=[inner.as_tool(tool_name="do_research", tool_description="research")],
+        model=_ScriptedModel([
+            [_msg("delegating"), _call("c1", "do_research", {"input": "q"})],
+            [_msg("final")],
+        ]),
+    )
+    _run(outer)
+    buf = sdk.buffer
+
+    # two runs: parent (Orchestrator) + delegated child (Researcher)
+    creates = [i for i in _run_items(buf) if i["type"] == "run_create"]
+    child = next(i for i in creates if i["run"].get("delegated_from"))
+    assert child["run"]["agent_identity"] == "did:web:bank.com:agents:researcher:v1"
+
+    delegate = next(e for e in _events(buf) if e["action"]["kind"] == "delegate")
+    assert delegate["delegation_details"]["framework_signal"] == "openai_agents_as_tool"
+    assert delegate["delegation_details"]["delegated_run_id"] == child["run"]["run_id"]
+    # the child's delegated_from points back at the delegate event
+    assert child["run"]["delegated_from"]["event_id"] == delegate["event_id"]
+    # the as-tool function is represented by the delegate, not a duplicate tool_call
+    assert "do_research" not in [
+        e["action"]["name"] for e in _events(buf) if e["action"]["kind"] == "tool_call"
+    ]
+    # delegate is ordered after the issuing llm_call in the parent run
+    parent_events = [
+        b.event for b in buf.snapshot()
+        if isinstance(b, BufferedEvent) and b.event["run_id"] == delegate["run_id"]
+    ]
+    kinds = [e["action"]["kind"] for e in parent_events]
+    assert kinds.index("llm_call") < kinds.index("delegate")
     _assert_all_wire_valid(buf)
 
 
