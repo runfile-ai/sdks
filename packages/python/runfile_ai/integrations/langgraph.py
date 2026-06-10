@@ -89,6 +89,7 @@ from ..run import (
     capture_event,
     create_run,
     emit_run_end,
+    expected_resumer_from,
     resume_run,
     suspend_run,
 )
@@ -716,6 +717,9 @@ def build_handler(agent_identity: str, conversation_id: Optional[str] = None) ->
                         detection_source="framework_inferred",
                         framework_signal=signal,
                         correlation_token=_registry.thread_for(run),
+                        # Passive: if the agent named where it escalated (a queue/role
+                        # in the interrupt value), record it as the expected resumer.
+                        expected_resumer=expected_resumer_from(values),
                     )
                 _registry.mark_suspended(run)
                 buf = _buffer()

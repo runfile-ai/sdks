@@ -83,6 +83,7 @@ from ..run import (
     capture_event,
     create_run,
     emit_run_end,
+    expected_resumer_from,
     resume_run,
     suspend_run,
 )
@@ -855,6 +856,8 @@ class _WrappedRunner:
                     "signal_name": "result.interruptions",
                 },
                 correlation_token=correlation_token,
+                # Passive: if the approval args named where it escalated, record it.
+                expected_resumer=expected_resumer_from([_approval_args(it) for it in interruptions]),
             )
         st.suspended = True
         st.pending_interruptions = list(interruptions)
