@@ -237,6 +237,20 @@ async def test_notification_permission_prompt_suspends(sdk, fake_claude) -> None
     _assert_all_wire_valid(sdk.buffer)
 
 
+async def test_permission_request_routing_flows_to_suspend(sdk, fake_claude) -> None:
+    """Claude splits the approval signals: the routing target rides on the
+    PermissionRequest tool args, the suspend is a separate Notification. The adapter
+    stashes the former (by session) and attaches it as the suspend's expected_resumer."""
+    req = _hook(AGENT, "PermissionRequest")
+    note = _hook(AGENT, "Notification")
+    await req(_base_input("s1", hook_event_name="PermissionRequest", tool_name="creditline_request_approval",
+                          tool_input={"summary": "x", "expected_resumer": "role:lead_credit_officer"}), None, None)
+    await note(_base_input("s1", hook_event_name="Notification", notification_type="permission_prompt", message="need approval"), None, None)
+    susp = [e for e in _events(sdk.buffer) if e["action"]["kind"] == "run_suspend"][0]
+    assert susp["suspension_details"]["expected_resumer"] == "role:lead_credit_officer"
+    _assert_all_wire_valid(sdk.buffer)
+
+
 async def test_notification_idle_and_resume(sdk, fake_claude) -> None:
     note = _hook(AGENT, "Notification")
     await note(_base_input("s1", hook_event_name="Notification", notification_type="idle_prompt", message="waiting"), None, None)
