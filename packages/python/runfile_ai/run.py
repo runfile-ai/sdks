@@ -12,6 +12,7 @@ Ambient run/parent/parallel-group context flows via :mod:`contextvars`.
 
 from __future__ import annotations
 
+import json as _json
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
@@ -471,6 +472,33 @@ def resume_run(
     )
     run.lifecycle_state = "active"
     return event_id
+
+
+def expected_resumer_from(value: Any) -> Optional[str]:
+    """Passively read an ``expected_resumer`` (routing/assignment target) from a
+    framework's native HITL signal — an ``interrupt()`` value or approval args.
+
+    The witness is a *passive listener*: it promotes the optional, framework-agnostic
+    ``expected_resumer`` key the agent may already include in its HITL payload (the
+    queue / role / team / persona it escalated to) to
+    ``suspension_details.expected_resumer``. It never guesses other fields and never
+    requires any Runfile-specific agent code — if the key isn't present the field
+    simply stays empty. Accepts a single value or a list (multiple interrupts).
+    """
+    candidates = value if isinstance(value, (list, tuple)) else [value]
+    for v in candidates:
+        if isinstance(v, str):
+            # Some frameworks carry HITL args as a JSON string (e.g. an OpenAI
+            # ToolApprovalItem.arguments); parse it. Non-JSON strings are skipped.
+            try:
+                v = _json.loads(v)
+            except (ValueError, TypeError):
+                continue
+        if isinstance(v, dict):
+            er = v.get("expected_resumer")
+            if isinstance(er, str) and er.strip():
+                return er
+    return None
 
 
 def abandon_run(*, reason: Optional[str] = None, run_id: Optional[str] = None) -> str:

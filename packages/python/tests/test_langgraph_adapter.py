@@ -54,6 +54,12 @@ def ask_human(q: str) -> str:
 
 
 @tool
+def ask_human_routed(q: str) -> str:
+    """Ask a human, naming the queue/role to escalate to (interrupts the graph)."""
+    return f"human:{interrupt({'question': q, 'expected_resumer': 'role:lead_credit_officer'})}"
+
+
+@tool
 def boom(q: str) -> str:
     """A tool that fails for real (not a control-flow signal)."""
     raise ValueError("tool exploded")
@@ -310,6 +316,38 @@ async def test_interrupt_then_resume_is_one_run_two_segments(sdk) -> None:
         for e in _events(sdk.buffer)
     )
     _assert_all_wire_valid(sdk.buffer)
+
+
+async def test_interrupt_captures_expected_resumer(sdk) -> None:
+    """Passive listener: when the agent names where it escalated in the interrupt
+    value, the adapter promotes it to suspension_details.expected_resumer (the
+    routing/assignment limb), with no Runfile-specific agent code."""
+    model = _model([
+        {"content": "ask", "tool_calls": [{"name": "ask_human_routed", "args": {"q": "approve?"}, "id": "c1"}]},
+        {"content": "done"},
+    ])
+    agent = rf_lg.instrument(
+        create_react_agent(model, [ask_human_routed], checkpointer=InMemorySaver()), agent_identity=AGENT
+    )
+    await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        config={"configurable": {"thread_id": "T-routed"}},
+    )
+    susp = [e for e in _events(sdk.buffer) if e["action"]["kind"] == "run_suspend"][0]
+    assert susp["suspension_details"]["expected_resumer"] == "role:lead_credit_officer"
+    _assert_all_wire_valid(sdk.buffer)
+
+
+def test_expected_resumer_from_reads_only_the_standard_key() -> None:
+    from runfile_ai.run import expected_resumer_from
+
+    assert expected_resumer_from({"expected_resumer": "queue:fraud"}) == "queue:fraud"
+    assert expected_resumer_from([{"question": "x"}, {"expected_resumer": "role:mgr"}]) == "role:mgr"
+    # JSON-string args (e.g. an OpenAI ToolApprovalItem.arguments) are parsed
+    assert expected_resumer_from('{"amount": 100, "expected_resumer": "role:officer"}') == "role:officer"
+    assert expected_resumer_from({"question": "x"}) is None      # never guesses other fields
+    assert expected_resumer_from("just a string") is None        # non-JSON string skipped
+    assert expected_resumer_from({"expected_resumer": ""}) is None  # blank ignored
 
 
 # --------------------------------------------------------------------------- #

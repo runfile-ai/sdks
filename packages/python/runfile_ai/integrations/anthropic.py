@@ -80,6 +80,7 @@ from ..run import (
     capture_event,
     create_run,
     emit_run_end,
+    expected_resumer_from,
     resume_run,
     suspend_run,
 )
@@ -231,6 +232,9 @@ class _Registry:
         self._subagents: dict[tuple[str, str], Run] = {}
         # Causal-link scratch keyed by run_id; cleared when the run is popped.
         self._links: dict[str, _CausalLinks] = {}
+        # Routing target stashed from a PermissionRequest's tool args, applied to the
+        # Notification suspend that follows (Claude splits the two signals). By session.
+        self._pending_resumer: dict[str, str] = {}
 
     def links_for(self, run: Run) -> _CausalLinks:
         """The causal-link scratch for ``run``, created on first use."""
@@ -267,7 +271,17 @@ class _Registry:
             run = self._sessions.pop(session_id, None)
             if run is not None:
                 self._links.pop(run.run_id, None)
+            self._pending_resumer.pop(session_id, None)
             return run
+
+    def set_pending_resumer(self, session_id: str, expected_resumer: str) -> None:
+        """Stash a routing target seen on a PermissionRequest, for the next suspend."""
+        with self._lock:
+            self._pending_resumer[session_id] = expected_resumer
+
+    def pop_pending_resumer(self, session_id: str) -> Optional[str]:
+        with self._lock:
+            return self._pending_resumer.pop(session_id, None)
 
     def create_subagent(
         self, session_id: str, agent_id: str, child: Run
@@ -456,6 +470,14 @@ def build_hooks(
                     name=input_data.get("tool_name", "unknown"),
                     payload=input_data.get("tool_input"),
                 )
+            # Claude splits the approval signals: the routing target (if the agent
+            # named one) is in the tool args here, while the suspend is a separate
+            # Notification. Stash it so on_notification can attach it as the
+            # expected_resumer of the run_suspend. Passive; keyed by session.
+            sid = input_data.get("session_id")
+            er = expected_resumer_from(input_data.get("tool_input"))
+            if sid is not None and er is not None:
+                _registry.set_pending_resumer(sid, er)
         except Exception:
             pass
         return {}
@@ -480,6 +502,10 @@ def build_hooks(
                         detection_source="framework_inferred",
                         framework_signal=signal,
                         correlation_token=session_id,
+                        # Routing target from the preceding PermissionRequest, if any.
+                        expected_resumer=(
+                            _registry.pop_pending_resumer(session_id) if session_id else None
+                        ),
                     )
                 elif ntype in _RESUME_NOTIFICATIONS:
                     resume_run(
