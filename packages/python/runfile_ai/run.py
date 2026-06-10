@@ -12,6 +12,7 @@ Ambient run/parent/parallel-group context flows via :mod:`contextvars`.
 
 from __future__ import annotations
 
+import json as _json
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
@@ -486,6 +487,13 @@ def expected_resumer_from(value: Any) -> Optional[str]:
     """
     candidates = value if isinstance(value, (list, tuple)) else [value]
     for v in candidates:
+        if isinstance(v, str):
+            # Some frameworks carry HITL args as a JSON string (e.g. an OpenAI
+            # ToolApprovalItem.arguments); parse it. Non-JSON strings are skipped.
+            try:
+                v = _json.loads(v)
+            except (ValueError, TypeError):
+                continue
         if isinstance(v, dict):
             er = v.get("expected_resumer")
             if isinstance(er, str) and er.strip():

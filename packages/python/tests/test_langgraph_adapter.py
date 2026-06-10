@@ -343,8 +343,10 @@ def test_expected_resumer_from_reads_only_the_standard_key() -> None:
 
     assert expected_resumer_from({"expected_resumer": "queue:fraud"}) == "queue:fraud"
     assert expected_resumer_from([{"question": "x"}, {"expected_resumer": "role:mgr"}]) == "role:mgr"
+    # JSON-string args (e.g. an OpenAI ToolApprovalItem.arguments) are parsed
+    assert expected_resumer_from('{"amount": 100, "expected_resumer": "role:officer"}') == "role:officer"
     assert expected_resumer_from({"question": "x"}) is None      # never guesses other fields
-    assert expected_resumer_from("just a string") is None
+    assert expected_resumer_from("just a string") is None        # non-JSON string skipped
     assert expected_resumer_from({"expected_resumer": ""}) is None  # blank ignored
 
 
