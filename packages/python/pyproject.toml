@@ -40,8 +40,12 @@ mcp = ["mcp>=1.0"]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
-  "mypy>=1.10",
-  "ruff>=0.5",
+  # Exact pins: lint/type results change across releases (ruff 0.17 widened
+  # its default rule set and flags ~250 existing lines), so a floating range
+  # turns every upstream release into a CI failure. Bump deliberately and fix
+  # what the new version reports in the same PR.
+  "mypy==2.1.0",
+  "ruff==0.15.15",
   # The LangGraph adapter tests drive a real graph; without this the suite
   # importorskips them. langchain-core comes transitively.
   "langgraph>=1.0",
