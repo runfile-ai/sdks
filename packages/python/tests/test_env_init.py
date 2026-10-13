@@ -53,10 +53,10 @@ def test_environment_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert inst.environment == "staging"
 
 
-def test_test_key_defaults_to_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_test_key_defaults_to_non_production(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("RUNFILE_ENVIRONMENT", raising=False)
     inst = runfile_ai.init(api_key=VALID_TEST_KEY, **_OFFLINE)
-    assert inst.environment == "sandbox"
+    assert inst.environment == "non-production"
 
 
 def test_live_key_defaults_to_production(monkeypatch: pytest.MonkeyPatch) -> None:

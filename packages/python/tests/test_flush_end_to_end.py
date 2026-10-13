@@ -144,12 +144,13 @@ def test_207_partial_is_not_retried(fake_ingest: FakeIngest) -> None:
     assert result.items_rejected == 1
 
 
-def test_sandbox_key_ships_valid_sandbox_items(fake_ingest: FakeIngest) -> None:
-    # An rf_test_ key reports the sandbox environment. With runfile-ai-schemas
-    # 0.10+ every item validates locally; an older schemas package has no
-    # `sandbox`, so the items would only ship raw and be counted invalid.
+def test_test_key_ships_valid_non_production_items(fake_ingest: FakeIngest) -> None:
+    # An rf_test_ key seals the `non-production` class. With runfile-ai-schemas
+    # 0.10+ (environment is a free name) every item validates locally; an older
+    # schemas package only accepts its fixed list, so the items would ship raw
+    # and be counted invalid.
     inst = _init(fake_ingest)
-    assert inst.environment == "sandbox"
+    assert inst.environment == "non-production"
     with runfile_ai.run(agent_identity=AGENT):
         runfile_ai.capture_event(kind="tool_call", name="credit_check")
     result = inst._flusher.flush_now()
@@ -157,9 +158,9 @@ def test_sandbox_key_ships_valid_sandbox_items(fake_ingest: FakeIngest) -> None:
     assert result.items_invalid == 0
     body = _batch_posts(fake_ingest)[0]
     run_create = next(it for it in body["items"] if it["type"] == "run_create")
-    assert run_create["run"]["environment"] == "sandbox"
+    assert run_create["run"]["environment"] == "non-production"
     events = [it["event"] for it in body["items"] if it["type"] == "event"]
-    assert {e["environment"] for e in events} == {"sandbox"}
+    assert {e["environment"] for e in events} == {"non-production"}
 
 
 def test_invalid_event_is_shipped_not_dropped(fake_ingest: FakeIngest) -> None:

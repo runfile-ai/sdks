@@ -205,16 +205,18 @@ def _env_truthy(name: str) -> bool:
 
 
 def _environment_from_key(api_key: str) -> Optional[str]:
-    """The environment an API key belongs to, read from its marker.
+    """The environment class an API key proves, read from its marker.
 
-    Each key belongs to one agent in one environment, and ingest rejects data
-    whose declared environment disagrees with the key's — so deriving it from
-    the key is what lets ``init()`` work with just ``RUNFILE_API_KEY`` set.
+    The marker only says whether the key's environment is production
+    (``rf_live_``) or not (``rf_test_``), so that class is what the SDK seals;
+    the platform labels the run with the key's exact environment name (e.g.
+    ``sandbox``) and rejects a sealed value that contradicts the key. Sealing
+    the class keeps production-vs-test tamper-evident without guessing a name.
     """
     if api_key.startswith("rf_live_"):
         return "production"
     if api_key.startswith("rf_test_"):
-        return "sandbox"
+        return "non-production"
     return None
 
 
@@ -239,8 +241,8 @@ def init(
 
     - ``api_key``        ← ``RUNFILE_API_KEY``
     - ``region``         ← ``RUNFILE_REGION``      (default ``eu-west-2``)
-    - ``environment``    ← ``RUNFILE_ENVIRONMENT`` (default: from the key —
-      ``rf_live_…`` → ``production``, ``rf_test_…`` → ``sandbox``)
+    - ``environment``    ← ``RUNFILE_ENVIRONMENT`` (default: the class the key
+      proves — ``rf_live_…`` → ``production``, ``rf_test_…`` → ``non-production``)
     - ``disabled``       ← ``RUNFILE_DISABLED``    (``1``/``true``/``yes``/``on``)
     - ``spool_dir``      ← ``RUNFILE_SPOOL_DIR``
 
