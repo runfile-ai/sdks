@@ -144,6 +144,24 @@ def test_207_partial_is_not_retried(fake_ingest: FakeIngest) -> None:
     assert result.items_rejected == 1
 
 
+def test_sandbox_key_ships_valid_sandbox_items(fake_ingest: FakeIngest) -> None:
+    # An rf_test_ key reports the sandbox environment. With runfile-ai-schemas
+    # 0.10+ every item validates locally; an older schemas package has no
+    # `sandbox`, so the items would only ship raw and be counted invalid.
+    inst = _init(fake_ingest)
+    assert inst.environment == "sandbox"
+    with runfile_ai.run(agent_identity=AGENT):
+        runfile_ai.capture_event(kind="tool_call", name="credit_check")
+    result = inst._flusher.flush_now()
+
+    assert result.items_invalid == 0
+    body = _batch_posts(fake_ingest)[0]
+    run_create = next(it for it in body["items"] if it["type"] == "run_create")
+    assert run_create["run"]["environment"] == "sandbox"
+    events = [it["event"] for it in body["items"] if it["type"] == "event"]
+    assert {e["environment"] for e in events} == {"sandbox"}
+
+
 def test_invalid_event_is_shipped_not_dropped(fake_ingest: FakeIngest) -> None:
     # llm_call without model_ref fails the schema's conditional. The flusher must
     # NOT drop it (that would tear the chain) — it ships raw and flags it.

@@ -204,6 +204,20 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _environment_from_key(api_key: str) -> Optional[str]:
+    """The environment an API key belongs to, read from its marker.
+
+    Each key belongs to one agent in one environment, and ingest rejects data
+    whose declared environment disagrees with the key's — so deriving it from
+    the key is what lets ``init()`` work with just ``RUNFILE_API_KEY`` set.
+    """
+    if api_key.startswith("rf_live_"):
+        return "production"
+    if api_key.startswith("rf_test_"):
+        return "sandbox"
+    return None
+
+
 def init(
     api_key: str | None = None,
     *,
@@ -225,7 +239,8 @@ def init(
 
     - ``api_key``        ← ``RUNFILE_API_KEY``
     - ``region``         ← ``RUNFILE_REGION``      (default ``eu-west-2``)
-    - ``environment``    ← ``RUNFILE_ENVIRONMENT`` (default ``production``)
+    - ``environment``    ← ``RUNFILE_ENVIRONMENT`` (default: from the key —
+      ``rf_live_…`` → ``production``, ``rf_test_…`` → ``sandbox``)
     - ``disabled``       ← ``RUNFILE_DISABLED``    (``1``/``true``/``yes``/``on``)
     - ``spool_dir``      ← ``RUNFILE_SPOOL_DIR``
 
@@ -246,7 +261,12 @@ def init(
             "(or set RUNFILE_DISABLED=1 to run the SDK as a no-op)"
         )
     resolved_region = region or os.environ.get("RUNFILE_REGION") or DEFAULT_REGION
-    resolved_environment = environment or os.environ.get("RUNFILE_ENVIRONMENT") or "production"
+    resolved_environment = (
+        environment
+        or os.environ.get("RUNFILE_ENVIRONMENT")
+        or _environment_from_key(resolved_api_key or "")
+        or "production"
+    )
 
     _instance = RunfileClient(
         resolved_api_key or "",

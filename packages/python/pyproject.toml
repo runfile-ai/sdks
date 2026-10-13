@@ -14,7 +14,10 @@ keywords = ["ai", "agents", "audit", "observability", "compliance", "langgraph"]
 dependencies = [
   "httpx>=0.27",
   "cryptography>=42.0",
-  "runfile-ai-schemas>=0.5,<1.0",
+  # Pinned to one schemas minor: pre-1.0 minors have changed the event hash
+  # projection (0.7, 0.8), and an SDK hashing with a different projection than
+  # the platform produces false chain breaks. 0.10 adds the `sandbox` environment.
+  "runfile-ai-schemas>=0.10,<0.11",
 ]
 
 [project.urls]

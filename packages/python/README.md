@@ -29,7 +29,7 @@ over defaults:
 |-----|---------|---------|
 | `api_key` | `RUNFILE_API_KEY` | — (required) |
 | `region` | `RUNFILE_REGION` | `eu-west-2` |
-| `environment` | `RUNFILE_ENVIRONMENT` | `production` |
+| `environment` | `RUNFILE_ENVIRONMENT` | from the key: `rf_live_…` → `production`, `rf_test_…` → `sandbox` |
 | `disabled` | `RUNFILE_DISABLED` | `false` |
 
 `base_url` is derived as `https://api.<region>.runfile.ai` unless overridden.
