@@ -36,7 +36,10 @@ langgraph = ["langgraph>=1.0"]
 # tool_approval_requested — which misstates HITL in the audit trail. Capped to
 # the tested range until the adapter is fixed:
 # https://github.com/runfile-ai/sdks/issues/16
-openai-agents = ["openai-agents>=0.1,<0.18"]
+# openai<2.42: newer openai makes InputTokensDetails require a field that
+# openai-agents 0.17.x does not set, so Runner.run crashes inside the
+# framework (seen on openai 2.54.0). 2.41.0 is the tested version.
+openai-agents = ["openai-agents>=0.1,<0.18", "openai<2.42"]
 # >=0.1.29: first release with the Notification, SubagentStart, and
 # PermissionRequest hook events (PostToolUseFailure landed in 0.1.26). Older
 # installs silently ignore unknown hook keys, so the adapter version-checks too.
@@ -56,8 +59,9 @@ dev = [
   "langgraph>=1.0",
   # The OpenAI Agents adapter tests drive a real Runner with a scripted model;
   # without this the suite importorskips them. openai comes transitively.
-  # Same cap as the openai-agents extra (issue #16).
+  # Same caps as the openai-agents extra (issue #16).
   "openai-agents>=0.1,<0.18",
+  "openai<2.42",
 ]
 
 [tool.hatch.build.targets.wheel]

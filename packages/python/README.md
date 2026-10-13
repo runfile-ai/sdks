@@ -25,7 +25,7 @@ graph = runfile_langgraph.instrument(
 | Extra | Framework | Supported | Notes |
 |-------|-----------|-----------|-------|
 | `langgraph` | `langgraph` | `>=1.0` | HITL interrupt / resume capture needs 1.0+ |
-| `openai-agents` | `openai-agents` | `>=0.1,<0.18` | **Capped.** On newer releases (seen on 0.23.1) a human-approved tool call is captured out of order (`tool_call` before `tool_approval_requested`), which misstates human oversight in the audit trail. Tracked in [#16](https://github.com/runfile-ai/sdks/issues/16). |
+| `openai-agents` | `openai-agents` | `>=0.1,<0.18` | **Capped.** On newer releases (seen on 0.23.1) a human-approved tool call is captured out of order (`tool_call` before `tool_approval_requested`), which misstates human oversight in the audit trail. Also caps `openai<2.42`: newer `openai` adds a required usage field that openai-agents 0.17 doesn't set, so runs crash inside the framework. Tracked in [#16](https://github.com/runfile-ai/sdks/issues/16). |
 | `anthropic` | `claude-agent-sdk` | `>=0.1.29` | needs the Notification / SubagentStart / PermissionRequest hooks |
 | `mcp` | `mcp` | `>=1.0` | adapter not implemented yet |
 
