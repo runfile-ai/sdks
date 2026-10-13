@@ -53,6 +53,30 @@ def test_environment_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert inst.environment == "staging"
 
 
+def test_test_key_defaults_to_non_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RUNFILE_ENVIRONMENT", raising=False)
+    inst = runfile_ai.init(api_key=VALID_TEST_KEY, **_OFFLINE)
+    assert inst.environment == "non-production"
+
+
+def test_live_key_defaults_to_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RUNFILE_ENVIRONMENT", raising=False)
+    inst = runfile_ai.init(api_key=OTHER_KEY, **_OFFLINE)
+    assert inst.environment == "production"
+
+
+def test_env_var_overrides_key_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNFILE_ENVIRONMENT", "production")
+    inst = runfile_ai.init(api_key=VALID_TEST_KEY, **_OFFLINE)
+    assert inst.environment == "production"
+
+
+def test_explicit_environment_overrides_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNFILE_ENVIRONMENT", "production")
+    inst = runfile_ai.init(api_key=VALID_TEST_KEY, environment="sandbox", **_OFFLINE)
+    assert inst.environment == "sandbox"
+
+
 def test_disabled_from_env_is_a_silent_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNFILE_DISABLED", "1")
     monkeypatch.delenv("RUNFILE_API_KEY", raising=False)

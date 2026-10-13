@@ -204,6 +204,22 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _environment_from_key(api_key: str) -> Optional[str]:
+    """The environment class an API key proves, read from its marker.
+
+    The marker only says whether the key's environment is production
+    (``rf_live_``) or not (``rf_test_``), so that class is what the SDK seals;
+    the platform labels the run with the key's exact environment name (e.g.
+    ``sandbox``) and rejects a sealed value that contradicts the key. Sealing
+    the class keeps production-vs-test tamper-evident without guessing a name.
+    """
+    if api_key.startswith("rf_live_"):
+        return "production"
+    if api_key.startswith("rf_test_"):
+        return "non-production"
+    return None
+
+
 def init(
     api_key: str | None = None,
     *,
@@ -225,7 +241,8 @@ def init(
 
     - ``api_key``        ← ``RUNFILE_API_KEY``
     - ``region``         ← ``RUNFILE_REGION``      (default ``eu-west-2``)
-    - ``environment``    ← ``RUNFILE_ENVIRONMENT`` (default ``production``)
+    - ``environment``    ← ``RUNFILE_ENVIRONMENT`` (default: the class the key
+      proves — ``rf_live_…`` → ``production``, ``rf_test_…`` → ``non-production``)
     - ``disabled``       ← ``RUNFILE_DISABLED``    (``1``/``true``/``yes``/``on``)
     - ``spool_dir``      ← ``RUNFILE_SPOOL_DIR``
 
@@ -246,7 +263,12 @@ def init(
             "(or set RUNFILE_DISABLED=1 to run the SDK as a no-op)"
         )
     resolved_region = region or os.environ.get("RUNFILE_REGION") or DEFAULT_REGION
-    resolved_environment = environment or os.environ.get("RUNFILE_ENVIRONMENT") or "production"
+    resolved_environment = (
+        environment
+        or os.environ.get("RUNFILE_ENVIRONMENT")
+        or _environment_from_key(resolved_api_key or "")
+        or "production"
+    )
 
     _instance = RunfileClient(
         resolved_api_key or "",

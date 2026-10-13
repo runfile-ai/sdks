@@ -15,7 +15,7 @@ const API_KEY_RE = /^rf_(live|test)_[a-z0-9]{32}$/;
 
 export interface InitOptions {
   apiKey: string;
-  environment?: 'production' | 'staging' | 'development';
+  environment?: 'production' | 'staging' | 'development' | 'sandbox';
   region?: string;
   baseUrl?: string;
   disabled?: boolean;
