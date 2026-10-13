@@ -49,18 +49,18 @@ jobs:
       name: release
       url: https://pypi.org/project/runfile-ai/
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # full history so changesets can build changelogs
 
       # Version comes from package.json "packageManager" (pnpm@9.12.0); passing it
-      # here too makes action-setup@v4 error with ERR_PNPM_BAD_PM_VERSION.
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      # here too makes pnpm/action-setup error with ERR_PNPM_BAD_PM_VERSION.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -133,8 +133,8 @@ jobs:
       run:
         working-directory: packages/verifier-cli
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.22'
       # TODO: matrix build linux/macos/windows × amd64/arm64; attach to release.
