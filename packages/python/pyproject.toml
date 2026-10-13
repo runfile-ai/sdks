@@ -31,7 +31,12 @@ Source = "https://github.com/runfile-ai/sdks"
 # On older langgraph the adapter still loads (falls back to the plain LangChain
 # BaseCallbackHandler) but can't observe graph interrupt / resume.
 langgraph = ["langgraph>=1.0"]
-openai-agents = ["openai-agents>=0.1"]
+# <0.18: on newer openai-agents (seen on 0.23.1) the adapter captures a
+# human-approved tool call out of order — tool_call before
+# tool_approval_requested — which misstates HITL in the audit trail. Capped to
+# the tested range until the adapter is fixed:
+# https://github.com/runfile-ai/sdks/issues/16
+openai-agents = ["openai-agents>=0.1,<0.18"]
 # >=0.1.29: first release with the Notification, SubagentStart, and
 # PermissionRequest hook events (PostToolUseFailure landed in 0.1.26). Older
 # installs silently ignore unknown hook keys, so the adapter version-checks too.
@@ -51,7 +56,8 @@ dev = [
   "langgraph>=1.0",
   # The OpenAI Agents adapter tests drive a real Runner with a scripted model;
   # without this the suite importorskips them. openai comes transitively.
-  "openai-agents>=0.1",
+  # Same cap as the openai-agents extra (issue #16).
+  "openai-agents>=0.1,<0.18",
 ]
 
 [tool.hatch.build.targets.wheel]
